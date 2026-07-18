@@ -31,13 +31,15 @@ Extract the embedded Gradle init script and attach it to your build:
 
 ```yaml
 - name: Enable lightning build telemetry
-  run: lightning init-script --out lightning.init.gradle
+  run: lightning init-script --out "$RUNNER_TEMP/lightning.init.gradle"
 
 - name: Build
-  run: ./gradlew build --init-script lightning.init.gradle
+  run: ./gradlew build --init-script "$RUNNER_TEMP/lightning.init.gradle"
   env:
     LIGHTNING_URL: https://lightning.example.com
 ```
+
+Extract the script outside the repository (as above): a `.gradle` file inside the working tree joins the selective-execution invalidation set and would force one extra `lightning sync`.
 
 The script collects per-task timings and outcomes (success / up-to-date / from-cache / failed / skipped), configuration and total build time, requested tasks, Gradle/JDK versions, and git/CI metadata, then POSTs one JSON document to `/api/builds` when the build finishes. The server URL comes from the `lightning.url` Gradle property (`-Plightning.url=...`) or the `LIGHTNING_URL` env var. Telemetry is fail-safe: without a URL it does nothing, and any error is logged and swallowed — it never breaks the build.
 

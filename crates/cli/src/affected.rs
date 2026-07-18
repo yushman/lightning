@@ -65,8 +65,9 @@ pub fn select(dir: &Path, args: &SelectArgs) -> Result<Outcome, String> {
         .filter(|f| !ignore.iter().any(|p| p.matches(f)))
         .collect();
 
-    // staleness: recomputed hash mismatch, or the diff touches an
-    // invalidation glob (paranoid mode, design D4)
+    // staleness: the recomputed hash is the sole authority — it covers the
+    // full invalidation set against the current working tree, so a diff-based
+    // check adds no FN protection, only false positives
     let mut lock = match Lock::load(dir) {
         Ok(lock) => Some(lock),
         Err(_) if !dir.join(lock::FILE_NAME).exists() => None,
@@ -80,15 +81,8 @@ pub fn select(dir: &Path, args: &SelectArgs) -> Result<Outcome, String> {
             let mut globs = cfg.invalidate_on.clone();
             globs.extend(sync::included_build_globs(&l.included_builds));
             let hash = sync::build_files_hash(dir, &globs)?;
-            let matchers = sync::invalidation_matchers(&globs)?;
-            if l.build_files_hash != hash {
-                Some("lightning.lock is stale (build files changed since sync)".to_string())
-            } else {
-                files
-                    .iter()
-                    .find(|f| sync::matches_any(&matchers, f))
-                    .map(|f| format!("the diff touches build file {f}"))
-            }
+            (l.build_files_hash != hash)
+                .then(|| "lightning.lock is stale (build files changed since sync)".to_string())
         }
     };
     if let Some(reason) = stale {
@@ -309,6 +303,69 @@ mod tests {
         let paths: Vec<&str> = modules.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(paths, vec![":app", ":fixtures"]);
         assert_eq!(modules[0].1, Reason::TestDependency);
+    }
+
+    #[test]
+    fn resynced_build_file_change_is_not_stale() {
+        let dir = std::env::temp_dir().join(format!("lightning-resync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("app/src")).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("app/build.gradle"), "// v1\n").unwrap();
+        std::fs::write(dir.join("app/src/A.java"), "class A {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        let base = {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        // build file modified after the base commit, lock synced AFTER that:
+        // its hash reflects the current tree, so selection must proceed
+        std::fs::write(dir.join("app/build.gradle"), "// v2\n").unwrap();
+        std::fs::write(dir.join("app/src/A.java"), "class A { int x; }\n").unwrap();
+        let mut l = lock();
+        l.modules = vec![Module {
+            path: ":app".into(),
+            dir: "app".into(),
+            source_dirs: vec!["app/src".into()],
+            tasks: vec![],
+            deps: vec![],
+        }];
+        l.build_files_hash = sync::build_files_hash(&dir, &[]).unwrap();
+        std::fs::write(
+            dir.join(lock::FILE_NAME),
+            serde_json::to_string(&l).unwrap(),
+        )
+        .unwrap();
+        let args = SelectArgs {
+            base: None,
+            base_sha: Some(base),
+            auto_sync: false,
+            no_uncommitted: false,
+        };
+        match select(&dir, &args).unwrap() {
+            Outcome::Selected(sel) => {
+                assert!(sel.everything.is_none(), "everything: {:?}", sel.everything);
+                assert_eq!(sel.modules.len(), 1);
+                assert_eq!(sel.modules[0].0, ":app");
+            }
+            Outcome::Stale(msg) => panic!("false stale: {msg}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -17,6 +17,9 @@ const INVALIDATION_GLOBS: &[&str] = &[
     "gradle/wrapper/gradle-wrapper.properties",
     "gradle.properties",
     "local.properties",
+    // lightning's own config shapes selection (ignore/invalidate_on), so a
+    // change to it must force a re-sync instead of mapping into the graph
+    "lightning.toml",
 ];
 
 /// Directories skipped by the hash walk: generated files must not flap it.

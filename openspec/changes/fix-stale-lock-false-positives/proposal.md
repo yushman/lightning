@@ -9,6 +9,7 @@ The diff-based check is strictly redundant: the hash is computed over the full i
 ## What Changes
 
 - `lightning affected` and `lightning run` treat the lock as stale **solely** on hash mismatch (or missing lock / wrong version). The "diff touches an invalidation glob" check is removed.
+- `lightning.toml` joins the invalidation hash set (its content shapes selection semantics, so a change forces re-sync) and is excluded from the diff like `lightning.lock` — dogfooding showed an uncommitted config permanently degrading selection to everything-affected via "outside all modules".
 - Regression test: modify a build file, re-sync, run `affected` — selection proceeds (no stale), and the modified build file maps through normal file-to-module rules.
 - README (EN/RU): recommend extracting the telemetry init script outside the repo (e.g. a temp dir) to avoid one forced re-sync; no behavioral dependency remains either way.
 

@@ -140,7 +140,9 @@ pub fn changed_files(
     let files = repo_relative
         .into_iter()
         .map(|p| paths::rebase(&p, &prefix))
-        .filter(|p| p != crate::lock::FILE_NAME) // the CLI's own artifact
+        // the CLI's own artifact and config: the lock never maps anywhere,
+        // the config participates via the invalidation hash instead
+        .filter(|p| p != crate::lock::FILE_NAME && p != crate::config::FILE_NAME)
         .collect();
     Ok(Diff { merge_base, files })
 }

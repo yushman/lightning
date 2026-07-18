@@ -31,13 +31,15 @@ cargo build --release
 
 ```yaml
 - name: Enable lightning build telemetry
-  run: lightning init-script --out lightning.init.gradle
+  run: lightning init-script --out "$RUNNER_TEMP/lightning.init.gradle"
 
 - name: Build
-  run: ./gradlew build --init-script lightning.init.gradle
+  run: ./gradlew build --init-script "$RUNNER_TEMP/lightning.init.gradle"
   env:
     LIGHTNING_URL: https://lightning.example.com
 ```
+
+Извлекайте скрипт вне репозитория (как выше): `.gradle`-файл внутри рабочего дерева попадает в инвалидационный набор селективного выполнения и потребует лишний `lightning sync`.
 
 Скрипт собирает тайминги и результаты тасок (success / up-to-date / from-cache / failed / skipped), время конфигурации и всей сборки, запрошенные таски, версии Gradle/JDK и git/CI-метаданные, а по завершении сборки отправляет один JSON-документ в `/api/builds`. URL сервера задаётся Gradle-свойством `lightning.url` (`-Plightning.url=...`) или переменной `LIGHTNING_URL`. Телеметрия fail-safe: без URL ничего не делает, любая ошибка логируется и глотается — сборку она не ломает никогда.
 
