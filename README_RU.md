@@ -123,3 +123,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: ./gradlew ${{ matrix.module }}:test
 ```
+
+## Лицензия
+
+Apache-2.0. См. [LICENSE](LICENSE).
