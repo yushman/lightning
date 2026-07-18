@@ -67,6 +67,8 @@ Decision: a **new subcommand**, not an extension of `run`. `run` is local-execut
 
 **Module-level (stages 1–2).** Units come straight from the lock: affected modules × resolved test task. No discovery problem exists — the lock already has tasks per module.
 
+**Small-unit coalescing.** One unit = one Gradle invocation = one configuration phase, and the configuration cache cannot amortize it across units (its key includes the requested task set). To keep the long tail of small modules from eating the distribution win, the planner coalesces units below a duration threshold into composite units (`:a:test :b:test :c:test`, weights summed); the ledger treats a composite unit atomically, so the FN-never construction is untouched. Batch leasing was rejected as a protocol complication that solves the same problem worse.
+
 **Class-level (stage 3).** Test classes are discovered from **phase-1 history**, not from the build: every class that ever reported a result for module M (see prerequisite P1, module attribution) is a known class with a known cumulative duration. The partitioner splits a module only when its expected duration exceeds a threshold (e.g. > 2× target shard time), producing K include-shards (greedy LPT over per-class durations) plus **one remainder shard** carrying the exclude list of all classes assigned to the K include-shards.
 
 Totality argument (FN-never): every known class is in exactly one include shard; every *unknown* class — new, renamed, or simply never seen by history — is not in any exclude list, therefore runs in the remainder shard **by construction**. History staleness can only misbalance, never drop. Deleted classes make an include filter match nothing; Gradle's "no tests found for filter" failure is downgraded by the worker to an empty-but-successful unit (recognized case, logged), so deletions do not fail sessions.
@@ -94,7 +96,8 @@ Workers do **not** call `lightning upload`. Phase-1 ingest is idempotent by `UNI
 - The flaky radar sees one run per CI run, same as today; retries *within* a worker's Gradle invocation still produce `mixed` verdicts (same-SHA evidence) exactly as phase 1 defines.
 - Session re-creation for the same CI attempt dedups by `run_key` as today.
 - Results from `infra_failed` attempts are **discarded**, not merged: a crashed JVM's partial XML must not fabricate pass/fail evidence. Only `completed` attempts feed the run.
-- Per-unit Gradle telemetry still flows through the ordinary phase-2 init script from each worker (separate build documents — correct, since they *are* separate builds).
+- Per-unit Gradle telemetry still flows through the ordinary phase-2 init script from each worker (separate build documents — correct, since they *are* separate builds), **marked as distribution builds** (see prerequisite P6) so shard builds don't flood the builds list, skew per-branch trend medians, or inflate cache hit-rate analytics.
+- The merged run is materialized on **any** terminal state, including `incomplete`: accepted attempts' results are real evidence, and in phase-1 semantics a test absent from a run is not a pass, so partial merges cannot create false negatives in the radar. The session verdict (exit 6) — not the merged run — is what makes incompleteness visible to CI.
 
 ### D6. Balancing and cold start
 
@@ -112,6 +115,8 @@ Static planning (stage 1) packs units into a requested number of bins with greed
 
 - *Ephemeral, CI-spawned*: a GitHub Actions matrix job per worker slot running `lightning worker --session <id> --drain`. Zero standing infrastructure — the natural on-ramp, and consistent with the platform assumption of ephemeral runners.
 - *Persistent pool*: user-managed machines running `lightning worker` as a service. Keeps warm Gradle daemons, working copies, and local caches → dramatically lower per-unit overhead; this is where distribution beats plain CI fan-out.
+
+A worker executes **one unit at a time**; concurrency is scaled by running more workers (one working copy per worker process), never by parallel Gradle invocations in a shared working copy.
 
 **Environment reproducibility** is explicitly the operator's contract, not lightning's: workers must provide the toolchain (JDK, Android SDK, accepted licenses) the build needs — the same contract every CI runner already fulfills. Lightning's part is *matching, not provisioning*: workers self-declare labels (`--label jdk17 --label android-sdk`), sessions declare required labels, the scheduler leases only on label superset. v1 labels are free-form user strings; no automatic environment fingerprinting (recorded as an open question).
 
@@ -131,7 +136,7 @@ Rules:
 
 - **Infra failure vs test failure**: a unit whose Gradle run finishes and yields parseable XML is `completed` — even with failing tests. Test failures are *results*, and the scheduler never re-runs them: retry-for-flakiness stays where phase 1 put it (in-build retries produce `mixed` verdicts; the radar reports, never hides). Only infra failures — lease expiry, worker crash, non-zero exit with no XML, checkout failure — requeue the unit, preferring a different worker on the next attempt.
 - **Worker dies mid-unit**: heartbeats stop → lease expires (TTL ≈ 3× expected duration, clamped to [5 min, unit timeout]) → attempt recorded `infra_failed`, unit requeued. If the "dead" worker later completes, at-least-once dedup applies (D4).
-- **Timeouts**: per-unit hard timeout = max(3× expected, 15 min), enforced worker-side (kill Gradle, report `infra_failed`/`timeout`) and server-side via lease expiry as the backstop; plus a session wall-clock timeout (default 60 min) so an empty worker pool cannot hang CI forever — it degrades to `incomplete` with "no workers leased" diagnostics.
+- **Timeouts**: per-unit hard timeout = max(3× expected, 15 min), enforced worker-side (kill Gradle, report `infra_failed`/`timeout`) and server-side via lease expiry as the backstop; plus a configurable session wall-clock timeout (default 60 min) so an empty worker pool cannot hang CI forever — it degrades to `incomplete` with "no workers leased" diagnostics. Additionally, a fast-fail: if no worker leases anything within a configurable grace period (default 5 min), the session goes `incomplete` immediately instead of burning the full wall-clock budget.
 - **Coverage soft check**: at merge time the server diffs reported classes per module against recent history; classes in history but absent from the session surface as a UI warning (deletions make this advisory, not an invariant — the *hard* invariant is the unit ledger, whose totality argument is D3's construction).
 - **Orchestrator dies**: the session is server-owned and runs to terminal state regardless; a re-run of the CI step re-attaches by session key instead of double-creating (same idempotency key as the merged run).
 
@@ -156,6 +161,7 @@ The project schema (`spec-driven`) defines four artifacts: proposal → specs �
 - **P3 — trunk keeps the cache warm (phase 3, operational).** Worker economics assume compile tasks hit the remote cache; the `/cache` analytics should first demonstrate a healthy hit rate on default-branch builds.
 - **P4 — lock trust in anger (phase 4, operational).** Task-name resolution and affected closure must have survived real monorepo use (Android task-name divergence, `srcDir` edge cases) before test-dist builds on them.
 - **P5 — auth posture review.** Three token knobs (cache, dist, future ingest) suggest consolidating into one server token story before adding the third; decide at stage-2 grooming.
+- **P6 — distribution marker in build telemetry (phase 2).** Shard builds are legitimate builds but must not pollute analytics: the init script propagates a distribution marker (e.g. `LIGHTNING_DIST_SESSION` → payload field), ingest stores it, and the UI segments or excludes dist builds by default in the builds list, per-branch trend medians, and cache hit-rate views. Small additive change; needed before stage 2 ships.
 
 ## Risks / Trade-offs
 
