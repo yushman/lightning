@@ -75,8 +75,12 @@ pub fn select(dir: &Path, args: &SelectArgs) -> Result<Outcome, String> {
     let stale = match &lock {
         None => Some("no lightning.lock found".to_string()),
         Some(l) => {
-            let hash = sync::build_files_hash(dir, &cfg.invalidate_on)?;
-            let matchers = sync::invalidation_matchers(&cfg.invalidate_on)?;
+            // included-build roots recorded in the lock join the invalidation
+            // set (dynamic `<dir>/**` globs), symmetric with sync
+            let mut globs = cfg.invalidate_on.clone();
+            globs.extend(sync::included_build_globs(&l.included_builds));
+            let hash = sync::build_files_hash(dir, &globs)?;
+            let matchers = sync::invalidation_matchers(&globs)?;
             if l.build_files_hash != hash {
                 Some("lightning.lock is stale (build files changed since sync)".to_string())
             } else {
@@ -108,10 +112,14 @@ pub fn select(dir: &Path, args: &SelectArgs) -> Result<Outcome, String> {
 }
 
 fn compute(lock: &Lock, files: &BTreeSet<String>) -> (Option<String>, Vec<(String, Reason)>) {
+    // everything-affected lists all modules except a bare root project:
+    // `:` without declared source dirs is a container (nothing to test) and
+    // would only receive meaningless root-level tasks from `run`
     let all = |reason: String| {
         let modules = lock
             .modules
             .iter()
+            .filter(|m| m.path != ":" || !m.source_dirs.is_empty())
             .map(|m| (m.path.clone(), Reason::Everything))
             .collect();
         (Some(reason), modules)
@@ -121,6 +129,18 @@ fn compute(lock: &Lock, files: &BTreeSet<String>) -> (Option<String>, Vec<(Strin
     }
     let mut changed: BTreeSet<String> = BTreeSet::new();
     for file in files {
+        // a file inside an included-build root is a build-logic change, not
+        // "outside all modules": convention plugins can reconfigure any
+        // module, so everything is affected — with an honest reason
+        if let Some(dir) = lock
+            .included_builds
+            .iter()
+            .find(|d| paths::is_under(file, d))
+        {
+            return all(format!(
+                "build logic changed: {file} is inside included build {dir}"
+            ));
+        }
         match map_file(&lock.modules, file) {
             Some(owners) => changed.extend(owners),
             None => return all(format!("changed file {file} is outside all modules")),
@@ -246,9 +266,10 @@ mod tests {
                     .collect(),
             };
         Lock {
-            version: 1,
+            version: crate::lock::VERSION,
             build_files_hash: "h".into(),
             unsupported: None,
+            included_builds: vec![],
             modules: vec![
                 module(":", ".", &[], &[]),
                 module(":core", "core", &["core/src/main/java", "shared/src"], &[]),
@@ -295,9 +316,46 @@ mod tests {
         for outside in ["ci-config.yml", "../above-root.md"] {
             let (everything, modules) = compute(&lock(), &files(&[outside]));
             assert!(everything.is_some(), "{outside} should degrade");
-            assert_eq!(modules.len(), lock().modules.len());
-            assert!(modules.iter().all(|(_, r)| *r == Reason::Everything));
+            // all modules except the bare root project `:`
+            assert_eq!(modules.len(), lock().modules.len() - 1);
+            assert!(
+                modules
+                    .iter()
+                    .all(|(p, r)| p != ":" && *r == Reason::Everything)
+            );
         }
+    }
+
+    #[test]
+    fn everything_keeps_root_with_declared_source_dirs() {
+        let mut l = lock();
+        l.modules[0].source_dirs = vec!["src/main/java".into()];
+        let (everything, modules) = compute(&l, &files(&["ci-config.yml"]));
+        assert!(everything.is_some());
+        assert!(modules.iter().any(|(p, _)| p == ":"));
+    }
+
+    #[test]
+    fn included_build_file_degrades_as_build_logic_change() {
+        let mut l = lock();
+        l.included_builds = vec!["gradle/plugins".into()];
+        let (everything, modules) =
+            compute(&l, &files(&["gradle/plugins/src/main/kotlin/Conv.kt"]));
+        let reason = everything.expect("degrades");
+        assert!(reason.contains("build logic changed"), "{reason}");
+        assert!(reason.contains("gradle/plugins"), "{reason}");
+        assert!(!reason.contains("outside all modules"), "{reason}");
+        assert_eq!(modules.len(), l.modules.len() - 1); // bare root excluded
+    }
+
+    #[test]
+    fn files_outside_included_builds_map_normally() {
+        let mut l = lock();
+        l.included_builds = vec!["gradle/plugins".into()];
+        let (everything, modules) = compute(&l, &files(&["core/src/main/java/C.java"]));
+        assert!(everything.is_none());
+        let paths: Vec<&str> = modules.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, vec![":app", ":core", ":lib"]);
     }
 
     #[test]
@@ -313,10 +371,13 @@ mod tests {
     #[test]
     fn unsupported_lock_selects_everything() {
         let mut l = lock();
-        l.unsupported = Some("composite build".into());
+        l.unsupported = Some("dependency substitution into included build(s)".into());
         let (everything, modules) = compute(&l, &files(&["core/src/main/java/C.java"]));
-        assert_eq!(everything.as_deref(), Some("composite build"));
-        assert_eq!(modules.len(), l.modules.len());
+        assert_eq!(
+            everything.as_deref(),
+            Some("dependency substitution into included build(s)")
+        );
+        assert_eq!(modules.len(), l.modules.len() - 1); // bare root excluded
     }
 
     #[test]

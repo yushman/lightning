@@ -1,0 +1,6 @@
+// substituting composite: :app depends on com.example:library, which the
+// included build provides — dependency substitution routes it out of this
+// build, so lightning must keep the everything-affected refusal
+rootProject.name = 'composite-substituting'
+includeBuild 'included-lib'
+include ':app'

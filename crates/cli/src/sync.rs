@@ -50,6 +50,14 @@ pub fn invalidation_matchers(extra: &[String]) -> Result<Vec<glob::Pattern>, Str
         .collect()
 }
 
+/// `<dir>/**` invalidation globs for included-build roots recorded in the
+/// lock (dir literals escaped so metacharacters cannot widen the pattern).
+pub fn included_build_globs(dirs: &[String]) -> Vec<String> {
+    dirs.iter()
+        .map(|d| format!("{}/**", glob::Pattern::escape(d)))
+        .collect()
+}
+
 pub fn matches_any(patterns: &[glob::Pattern], path: &str) -> bool {
     patterns.iter().any(|p| {
         p.matches(path)
@@ -114,7 +122,16 @@ fn collect_files(
 #[derive(serde::Deserialize)]
 struct Dump {
     unsupported: Option<String>,
+    #[serde(default)]
+    included_builds: Vec<DumpIncludedBuild>,
     modules: Vec<DumpModule>,
+}
+
+/// The script also dumps the included build's `name`; only the dir matters
+/// here (names appear in unsupported reasons composed by the script).
+#[derive(serde::Deserialize)]
+struct DumpIncludedBuild {
+    dir: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -161,10 +178,16 @@ fn normalize(dump: Dump, build_files_hash: String) -> Lock {
         })
         .collect();
     modules.sort_by(|a, b| a.path.cmp(&b.path));
+    let included_builds: BTreeSet<String> = dump
+        .included_builds
+        .iter()
+        .map(|b| paths::normalize(&b.dir))
+        .collect();
     Lock {
         version: VERSION,
         build_files_hash,
         unsupported: dump.unsupported,
+        included_builds: included_builds.into_iter().collect(),
         modules,
     }
 }
@@ -230,11 +253,21 @@ pub fn run(dir: &Path, extra_invalidation_globs: &[String]) -> Result<Lock, Stri
     let _ = std::fs::remove_file(&dump_path);
     let dump: Dump = serde_json::from_str(&raw).map_err(|e| format!("invalid model dump: {e}"))?;
 
-    let hash = build_files_hash(dir, extra_invalidation_globs)?;
-    let lock = normalize(dump, hash);
+    // the hash must watch included-build roots too: normalize first (dirs
+    // come from the dump), then hash with the same glob set `affected` will
+    // recompute from the lock
+    let mut lock = normalize(dump, String::new());
+    let mut globs = extra_invalidation_globs.to_vec();
+    globs.extend(included_build_globs(&lock.included_builds));
+    lock.build_files_hash = build_files_hash(dir, &globs)?;
     lock.save(dir)?;
     if let Some(reason) = &lock.unsupported {
         eprintln!("lightning: warning: {reason}; affected will select everything");
+    } else if !lock.included_builds.is_empty() {
+        eprintln!(
+            "lightning: included builds without dependency substitution (plugin-only): {}",
+            lock.included_builds.join(", ")
+        );
     }
     eprintln!(
         "lightning: wrote {} ({} modules)",
@@ -258,6 +291,46 @@ mod tests {
         assert_eq!(edge_kind("testFixturesImplementation"), EdgeKind::Main);
         assert_eq!(edge_kind("androidTestImplementation"), EdgeKind::Main);
         assert_eq!(edge_kind("integrationTestImplementation"), EdgeKind::Main);
+    }
+
+    #[test]
+    fn included_builds_normalize_sorted_and_deduped() {
+        let dump = Dump {
+            unsupported: None,
+            included_builds: vec![
+                DumpIncludedBuild {
+                    dir: "gradle/plugins".into(),
+                },
+                DumpIncludedBuild {
+                    dir: "./build-logic".into(),
+                },
+                DumpIncludedBuild {
+                    dir: "gradle/plugins".into(),
+                },
+            ],
+            modules: vec![],
+        };
+        let lock = normalize(dump, "h".into());
+        assert_eq!(lock.included_builds, vec!["build-logic", "gradle/plugins"]);
+    }
+
+    #[test]
+    fn included_build_globs_invalidate_their_roots_only() {
+        let globs = included_build_globs(&["gradle/plugins".into()]);
+        assert_eq!(globs, vec!["gradle/plugins/**"]);
+        let patterns = invalidation_matchers(&globs).unwrap();
+        assert!(matches_any(
+            &patterns,
+            "gradle/plugins/src/main/kotlin/Conventions.kt"
+        ));
+        assert!(matches_any(&patterns, "gradle/plugins/settings.gradle.kts"));
+        assert!(!matches_any(&patterns, "gradle/pluginsX/src/A.kt"));
+        assert!(!matches_any(&patterns, "app/src/main/java/A.java"));
+        // metacharacters in the dir stay literal
+        assert_eq!(
+            included_build_globs(&["build[x]".into()]),
+            vec!["build[[]x[]]/**"]
+        );
     }
 
     #[test]
@@ -335,6 +408,7 @@ mod tests {
     fn normalize_sorts_dedups_and_types_edges() {
         let dump = Dump {
             unsupported: None,
+            included_builds: vec![],
             modules: vec![
                 DumpModule {
                     path: ":lib".into(),
@@ -370,6 +444,7 @@ mod tests {
             ],
         };
         let lock = normalize(dump, "h".into());
+        assert!(lock.included_builds.is_empty());
         assert_eq!(lock.modules[0].path, ":core");
         let lib = &lock.modules[1];
         assert_eq!(lib.source_dirs, vec!["lib/src/main/java", "shared/src"]);

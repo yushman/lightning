@@ -4,10 +4,63 @@
 
 import groovy.json.JsonOutput
 import org.gradle.api.artifacts.ProjectDependency
+import org.gradle.api.artifacts.component.ProjectComponentIdentifier
+
+// Composite builds: an included build is safe (plugin-only) iff no module
+// dependency of the root build resolves to a project of another build
+// (dependency substitution) and its root lies inside the Gradle root, so the
+// invalidation walk can watch it. Anything unverifiable fails safe: the lock
+// is marked unsupported and affected selects everything.
+//
+// Detection resolves each project's dependency graphs (metadata only, no
+// artifact downloads) from `afterProject` — resolution must hold the
+// project's own lock, which `projectsEvaluated` does not provide. Unresolved
+// dependencies are safe to skip: a selector substituted to a project always
+// resolves locally.
+def substituted = Collections.synchronizedSortedSet(new TreeSet<String>())
+def unverifiable = Collections.synchronizedList(new ArrayList<String>())
+
+// Root-build identity: buildPath (Gradle 8.2+) or isCurrentBuild (older,
+// removed in 9); detection runs in the root build, so current == root.
+// Unknown API -> foreign (fail safe).
+def foreignBuild = { build ->
+    try {
+        if (build.hasProperty('buildPath')) {
+            return build.buildPath != ':'
+        }
+        return !build.currentBuild
+    } catch (Throwable ignored) {
+        return true
+    }
+}
+
+gradle.afterProject { p ->
+    if (p.gradle.parent != null || p.gradle.includedBuilds.isEmpty()) {
+        return // not the root build, or nothing to substitute into
+    }
+    if (!p.gradle.startParameter.projectProperties['lightning.lock.dump']) {
+        return
+    }
+    p.configurations.each { cfg ->
+        if (!cfg.canBeResolved || cfg.allDependencies.isEmpty()) {
+            return
+        }
+        try {
+            cfg.incoming.resolutionResult.allComponents { c ->
+                def id = c.id
+                if (id instanceof ProjectComponentIdentifier && foreignBuild(id.build)) {
+                    substituted << id.displayName.toString()
+                }
+            }
+        } catch (Throwable t) {
+            unverifiable << "cannot verify dependency substitution (${p.path} ${cfg.name}: ${t.message})".toString()
+        }
+    }
+}
 
 gradle.projectsEvaluated { g ->
     if (g.parent != null) {
-        return // only the root build dumps; included builds are unsupported
+        return // only the root build dumps its model
     }
     String out = g.startParameter.projectProperties['lightning.lock.dump']
     if (!out) {
@@ -43,12 +96,24 @@ gradle.projectsEvaluated { g ->
             deps       : deps,
         ]
     }
-    def included = g.includedBuilds*.name
+
+    def included = g.includedBuilds.collect { [name: it.name, dir: rel(it.projectDir)] }
+    String unsupported = null
+    if (!included.isEmpty()) {
+        def outside = included.findAll { it.dir == '..' || it.dir.startsWith('../') }
+        if (!outside.isEmpty()) {
+            unsupported = "included build(s) outside the build root: ${outside*.name.join(', ')}".toString()
+        } else if (!substituted.isEmpty()) {
+            unsupported = "dependency substitution into included build(s): ${substituted.join(', ')}".toString()
+        } else if (!unverifiable.isEmpty()) {
+            unsupported = unverifiable.first()
+        }
+    }
+
     def dump = [
-        unsupported: included
-                ? "composite build (included builds: ${included.join(', ')})".toString()
-                : null,
-        modules    : modules,
+        unsupported    : unsupported,
+        included_builds: included,
+        modules        : modules,
     ]
     new File(out).text = JsonOutput.toJson(dump)
 }

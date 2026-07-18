@@ -1,0 +1,4 @@
+// precompiled convention plugin applied by modules of the root build
+plugins {
+    id 'java-library'
+}

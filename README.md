@@ -76,9 +76,9 @@ lightning run test -- --continue    # gradle :m:test for affected modules only
 
 The diff is `merge-base(base, HEAD)..HEAD` plus uncommitted changes (disable with `--no-uncommitted`). The base ref defaults to `origin/main`; override with `--base <ref>`, or `--base-sha <sha>` when CI already knows the exact commit. Shallow clones are detected and reported (use `fetch-depth: 0`).
 
-A module is affected when it contains changed files, when a changed module is reachable from it through `main` edges (transitively), or when one of its direct `test` edges (`testImplementation` and friends) points into that set — test edges never propagate further. Anything ambiguous — a file outside every module, a composite build — selects **everything**: a false negative is never an option, an extra run is.
+A module is affected when it contains changed files, when a changed module is reachable from it through `main` edges (transitively), or when one of its direct `test` edges (`testImplementation` and friends) points into that set — test edges never propagate further. Anything ambiguous — a file outside every module, a change under an included build's root — selects **everything**: a false negative is never an option, an extra run is. Plugin-only composite builds (`includeBuild("build-logic")` for convention plugins) are fully supported; a composite where a module dependency is substituted into an included build still degrades to everything.
 
-The lock is invalidated by a hash over all build files (`**/*.gradle(.kts)`, `buildSrc/**`, `build-logic/**`, version catalog, wrapper and properties files); a stale lock aborts with exit code 4 unless you pass `--auto-sync`. Cache `lightning.lock` in CI keyed by that file set, or commit it — both work.
+The lock is invalidated by a hash over all build files (`**/*.gradle(.kts)`, `buildSrc/**`, `build-logic/**`, every included build's root recorded in the lock, version catalog, wrapper and properties files); a stale lock aborts with exit code 4 unless you pass `--auto-sync`. Cache `lightning.lock` in CI keyed by that file set, or commit it — both work.
 
 Optional `lightning.toml` next to the lock:
 

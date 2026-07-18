@@ -2,16 +2,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 pub const FILE_NAME: &str = "lightning.lock";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Lock {
     pub version: u32,
     pub build_files_hash: String,
-    /// Set when selection cannot be trusted (composite build): affected
-    /// degrades to everything-affected with this reason.
+    /// Set when selection cannot be trusted (dependency substitution into an
+    /// included build, unverifiable composite): affected degrades to
+    /// everything-affected with this reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unsupported: Option<String>,
+    /// Root-relative directories of included builds (plugin-only composites);
+    /// each joins the invalidation set as `<dir>/**`.
+    #[serde(default)]
+    pub included_builds: Vec<String>,
     pub modules: Vec<Module>,
 }
 
@@ -189,19 +194,21 @@ mod tests {
             version: VERSION,
             build_files_hash: "abc".into(),
             unsupported: None,
+            included_builds: vec!["gradle/plugins".into()],
             modules: vec![module(":app", &[(":lib", EdgeKind::Test)])],
         };
         lock.save(&dir).unwrap();
         let loaded = Lock::load(&dir).unwrap();
         assert_eq!(loaded.modules[0].deps[0].kind, EdgeKind::Test);
+        assert_eq!(loaded.included_builds, vec!["gradle/plugins"]);
 
+        // v1 locks (and any other version) are stale, not misparsed
         let text = std::fs::read_to_string(dir.join(FILE_NAME)).unwrap();
-        std::fs::write(
-            dir.join(FILE_NAME),
-            text.replace("\"version\": 1", "\"version\": 99"),
-        )
-        .unwrap();
-        assert!(Lock::load(&dir).unwrap_err().contains("lightning sync"));
+        for old in ["\"version\": 1", "\"version\": 99"] {
+            std::fs::write(dir.join(FILE_NAME), text.replace("\"version\": 2", old)).unwrap();
+            let err = Lock::load(&dir).unwrap_err();
+            assert!(err.contains("lightning sync"), "{err}");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

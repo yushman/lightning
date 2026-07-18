@@ -1,0 +1,7 @@
+// plugin-only composite: the included build provides convention plugins and
+// deliberately is NOT named build-logic (dynamic invalidation must catch it)
+pluginManagement {
+    includeBuild 'gradle/conventions'
+}
+rootProject.name = 'composite-plugin-only'
+include ':core', ':app'
