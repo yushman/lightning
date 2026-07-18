@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lightning — observability and acceleration for Gradle CI</title>
+<meta name="description" content="Self-hosted, open-source flaky-test radar, build telemetry, remote build cache and diff-aware test selection for Gradle and Android monorepos.">
+<style>
+:root {
+  --bg: #ffffff; --fg: #1a1d21; --muted: #5b6470; --line: #e5e8ec;
+  --accent: #f59e0b; --accent-fg: #7c4a03; --card: #f7f8fa; --code-bg: #14171c; --code-fg: #d8dee7;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1216; --fg: #e6e9ee; --muted: #98a2b0; --line: #242a32;
+    --accent: #fbbf24; --accent-fg: #fde68a; --card: #161b22; --code-bg: #0a0d11; --code-fg: #cdd5e0;
+  }
+}
+* { box-sizing: border-box; margin: 0; }
+body { background: var(--bg); color: var(--fg); font: 17px/1.65 -apple-system, "Segoe UI", Roboto, sans-serif; }
+.wrap { max-width: 960px; margin: 0 auto; padding: 0 24px; }
+header.hero { padding: 88px 0 56px; text-align: center; }
+.hero h1 { font-size: 56px; letter-spacing: -1px; }
+.hero h1 span { color: var(--accent); }
+.hero p.tag { font-size: 24px; margin-top: 14px; }
+.hero p.sub { color: var(--muted); max-width: 46em; margin: 18px auto 0; }
+.badges { margin-top: 22px; display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+.badge { border: 1px solid var(--line); border-radius: 999px; padding: 5px 14px; font-size: 14px; color: var(--muted); }
+.cta { margin-top: 30px; display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+.cta a { text-decoration: none; border-radius: 10px; padding: 12px 22px; font-weight: 600; }
+.cta a.primary { background: var(--accent); color: #1a1204; }
+.cta a.ghost { border: 1.5px solid var(--line); color: var(--fg); }
+section { padding: 48px 0; border-top: 1px solid var(--line); }
+h2 { font-size: 30px; letter-spacing: -0.4px; margin-bottom: 10px; }
+.lead { color: var(--muted); max-width: 46em; }
+.numbers { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-top: 28px; }
+.num { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 22px; }
+.num b { display: block; font-size: 30px; letter-spacing: -0.5px; }
+.num span { color: var(--muted); font-size: 15px; }
+.feature { display: grid; grid-template-columns: 1fr; gap: 22px; margin-top: 34px; }
+.feature h3 { font-size: 21px; }
+.feature p { color: var(--muted); max-width: 52em; margin-top: 6px; }
+.shot { margin-top: 16px; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,.08); }
+.shot img { display: block; width: 100%; }
+pre { background: var(--code-bg); color: var(--code-fg); border-radius: 12px; padding: 18px 20px; overflow-x: auto; font: 14px/1.6 "SF Mono", ui-monospace, Menlo, monospace; margin-top: 16px; }
+pre .c { color: #7d8aa0; } pre .g { color: #7ee787; } pre .y { color: #f0c674; }
+.steps { counter-reset: s; margin-top: 24px; }
+.step { display: flex; gap: 16px; padding: 14px 0; border-bottom: 1px dashed var(--line); align-items: baseline; }
+.step:last-child { border-bottom: 0; }
+.step::before { counter-increment: s; content: counter(s); flex: 0 0 30px; height: 30px; border-radius: 50%; background: var(--accent); color: #1a1204; font-weight: 700; display: grid; place-items: center; font-size: 15px; }
+footer { border-top: 1px solid var(--line); padding: 36px 0 60px; color: var(--muted); font-size: 15px; text-align: center; }
+footer a { color: inherit; }
+a { color: var(--accent-fg); }
+@media (prefers-color-scheme: dark) { a { color: var(--accent); } .cta a.primary { color: #14100a; } }
+</style>
+</head>
+<body>
+
+<header class="hero wrap">
+  <h1>⚡ light<span>ning</span></h1>
+  <p class="tag">See why your Gradle CI is slow and flaky — then fix it.</p>
+  <p class="sub">A self-hosted, open-source observability &amp; acceleration platform for Gradle and Android monorepos.
+  Flaky-test radar, build telemetry, remote build cache, and diff-aware test selection — a layer <em>above</em> your build, never inside it.</p>
+  <div class="badges">
+    <span class="badge">Apache-2.0</span>
+    <span class="badge">One static binary + SQLite</span>
+    <span class="badge">Rust</span>
+    <span class="badge">No build-plugin lock-in</span>
+  </div>
+  <div class="cta">
+    <a class="primary" href="https://github.com/yushman/lightning">GitHub →</a>
+    <a class="ghost" href="#start">15-minute setup</a>
+  </div>
+</header>
+
+<section class="wrap" id="numbers">
+  <h2>Measured on real monorepos</h2>
+  <p class="lead">Every number below comes from running lightning against nowinandroid (Google's 45-module Android showcase) and detekt — not from a benchmark lab.</p>
+  <div class="numbers">
+    <div class="num"><b>24 / 45</b><span>modules actually affected by a typical core-module change — the rest never run</span></div>
+    <div class="num"><b>exit in ms</b><span>docs-only PRs are decided before CI even installs a JDK</span></div>
+    <div class="num"><b>29s → 3s</b><span>rebuild after <code>clean</code> with the remote build cache</span></div>
+    <div class="num"><b>1 binary</b><span>server = single Rust executable with SQLite; <code>scp</code> it anywhere</span></div>
+  </div>
+</section>
+
+<section class="wrap">
+  <h2>Flaky-test radar</h2>
+  <p class="lead">One line in CI uploads your JUnit XML. The server keeps per-test history across runs and computes a <strong>deterministic</strong> flaky score — verdict flips on the same commit, flip-rate over a rolling window. No ML, no black box: you can recompute every score by hand. Genuine regressions don't pollute the list.</p>
+  <div class="shot"><img src="flaky.png" alt="Flaky tests list with scores and pass/fail trend strips"></div>
+</section>
+
+<section class="wrap">
+  <h2>Build telemetry — “build scans lite”</h2>
+  <p class="lead">A Gradle init script (fail-safe: it can never break your build) reports task timings, cache outcomes and configuration time. See what's slow, what stopped caching, and how much work every build avoided.</p>
+  <div class="shot"><img src="builds.png" alt="Builds list with duration and avoided-work percentage"></div>
+</section>
+
+<section class="wrap">
+  <h2>Remote build cache that explains itself</h2>
+  <p class="lead">Gradle's HTTP build cache protocol in the same binary — with LRU eviction, TTL, optional write token, and analytics on top: hit rates, top artifacts, and the tasks that never hit cache.</p>
+  <div class="shot"><img src="cache.png" alt="Cache storage stats and analytics"></div>
+</section>
+
+<section class="wrap">
+  <h2>Run only what a diff affects</h2>
+  <p class="lead"><code>lightning sync</code> snapshots your module graph once (typed main/test edges, source sets, per-module tasks). After that, deciding what a PR touches is pure Rust — <strong>no JVM starts</strong>. The correctness rule is absolute: an extra run is acceptable, a missed test never is.</p>
+  <pre><span class="c"># nowinandroid, one file changed in :core:model</span>
+$ lightning affected --base origin/main
+<span class="g">:core:model</span>  <span class="c">+ 23 reverse dependencies — 24 of 45 modules</span>
+
+<span class="c"># docs-only PR: decided before a JDK exists on the runner</span>
+$ lightning affected --quiet && echo run || echo skip
+<span class="y">skip</span>   <span class="c"># exit 3, milliseconds</span>
+
+<span class="c"># fan heavy runners out over affected modules only</span>
+$ lightning affected --format github-matrix</pre>
+</section>
+
+<section class="wrap" id="start">
+  <h2>Start in 15 minutes</h2>
+  <div class="steps">
+    <div class="step"><div><b>Run the server.</b> <code>lightning-server --addr 0.0.0.0:8080 --db lightning.db</code> — one binary, SQLite next to it, done.</div></div>
+    <div class="step"><div><b>Add one CI step.</b> <code>lightning upload --server https://…</code> after your tests. A week later you have a flaky radar with history and guilty commits.</div></div>
+    <div class="step"><div><b>Go deeper when the data earns it.</b> Telemetry init script → remote cache → diff-aware selection. Each step is independent; each is removable in a minute.</div></div>
+  </div>
+</section>
+
+<section class="wrap">
+  <h2>Why not just buy Develocity?</h2>
+  <p class="lead">Buy it if you can — it's excellent. lightning exists for everyone else: open source instead of enterprise pricing, self-hosted so build data never leaves your network, deterministic and explainable instead of ML scoring, and one binary instead of a platform team. And unlike build-plugin approaches, lightning works <em>outside</em> your build: adopting it risks nothing, removing it takes a minute.</p>
+</section>
+
+<footer>
+  <div class="wrap">
+    <a href="https://github.com/yushman/lightning">github.com/yushman/lightning</a> · Apache-2.0 · built for Gradle &amp; Android monorepos
+  </div>
+</footer>
+
+</body>
+</html>
