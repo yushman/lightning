@@ -3,3 +3,4 @@
 *.sqlite
 .idea/
 .DS_Store
+/docs/
