@@ -166,7 +166,14 @@ pub fn init(conn: &Connection) -> Result<()> {
             outcome TEXT NOT NULL,
             duration_ms INTEGER NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_task_executions_build ON task_executions(build_id);",
+        CREATE INDEX IF NOT EXISTS idx_task_executions_build ON task_executions(build_id);
+        CREATE TABLE IF NOT EXISTS cache_entries (
+            key TEXT PRIMARY KEY,
+            size INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            last_accessed_at TEXT NOT NULL DEFAULT (datetime('now')),
+            hit_count INTEGER NOT NULL DEFAULT 0
+        );",
     )
 }
 
@@ -564,6 +571,166 @@ pub fn build_tasks(
     .collect()
 }
 
+#[derive(Debug, Clone)]
+pub struct CacheEntryRow {
+    pub key: String,
+    pub size: i64,
+    pub created_at: String,
+    pub last_accessed_at: String,
+    pub hit_count: i64,
+}
+
+/// Inserts or overwrites a cache entry; an overwrite refreshes size and
+/// timestamps but keeps the accumulated hit count.
+pub fn cache_upsert(conn: &Connection, key: &str, size: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO cache_entries (key, size) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET size = excluded.size,
+             created_at = datetime('now'), last_accessed_at = datetime('now')",
+        params![key, size],
+    )?;
+    Ok(())
+}
+
+/// Returns whether the key is indexed; when it is, refreshes the last access
+/// time and, if `count_hit`, increments the hit count.
+pub fn cache_touch(conn: &Connection, key: &str, count_hit: bool) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE cache_entries SET last_accessed_at = datetime('now'),
+             hit_count = hit_count + ?2 WHERE key = ?1",
+        params![key, count_hit as i64],
+    )?;
+    Ok(n > 0)
+}
+
+pub fn cache_remove(conn: &Connection, key: &str) -> Result<()> {
+    conn.execute("DELETE FROM cache_entries WHERE key = ?1", [key])?;
+    Ok(())
+}
+
+pub fn cache_keys(conn: &Connection) -> Result<Vec<String>> {
+    conn.prepare("SELECT key FROM cache_entries")?
+        .query_map([], |r| r.get(0))?
+        .collect()
+}
+
+/// (entry count, total indexed bytes)
+pub fn cache_totals(conn: &Connection) -> Result<(i64, i64)> {
+    conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM cache_entries",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+}
+
+/// Deletes least-recently-accessed entries (never `keep_key`) until the total
+/// fits `max_total`. Returns the evicted keys; the caller deletes their files.
+pub fn cache_evict_lru(conn: &Connection, max_total: i64, keep_key: &str) -> Result<Vec<String>> {
+    let (_, mut total) = cache_totals(conn)?;
+    if total <= max_total {
+        return Ok(Vec::new());
+    }
+    let candidates: Vec<(String, i64)> = conn
+        .prepare(
+            "SELECT key, size FROM cache_entries WHERE key != ?1
+             ORDER BY last_accessed_at, key",
+        )?
+        .query_map([keep_key], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_>>()?;
+    let mut evicted = Vec::new();
+    for (key, size) in candidates {
+        if total <= max_total {
+            break;
+        }
+        conn.execute("DELETE FROM cache_entries WHERE key = ?1", [&key])?;
+        total -= size;
+        evicted.push(key);
+    }
+    Ok(evicted)
+}
+
+/// Deletes entries not accessed within the retention window. Returns the
+/// pruned keys; the caller deletes their files.
+pub fn cache_prune_expired(conn: &Connection, retention_days: u32) -> Result<Vec<String>> {
+    let cutoff = format!("-{retention_days} days");
+    conn.prepare(
+        "DELETE FROM cache_entries WHERE last_accessed_at < datetime('now', ?1) RETURNING key",
+    )?
+    .query_map([&cutoff], |r| r.get(0))?
+    .collect()
+}
+
+/// Stored artifacts by hit count descending.
+pub fn cache_top_entries(conn: &Connection, limit: usize) -> Result<Vec<CacheEntryRow>> {
+    conn.prepare(
+        "SELECT key, size, created_at, last_accessed_at, hit_count FROM cache_entries
+         ORDER BY hit_count DESC, last_accessed_at DESC, key LIMIT ?1",
+    )?
+    .query_map([limit as i64], |r| {
+        Ok(CacheEntryRow {
+            key: r.get(0)?,
+            size: r.get(1)?,
+            created_at: r.get(2)?,
+            last_accessed_at: r.get(3)?,
+            hit_count: r.get(4)?,
+        })
+    })?
+    .collect()
+}
+
+/// Overall task cache hit numbers over all retained builds:
+/// (from-cache tasks, tasks that needed work = from-cache + success + failed).
+pub fn cache_hit_totals(conn: &Connection) -> Result<(i64, i64)> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(outcome = 'from-cache'), 0),
+                COALESCE(SUM(outcome IN ('from-cache', 'success', 'failed')), 0)
+         FROM task_executions",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+}
+
+#[derive(Debug, Clone)]
+pub struct NeverCachedRow {
+    pub path: String,
+    pub executions: i64,
+    pub total_ms: i64,
+}
+
+/// Task paths executed (success/failed) at least `min_executions` times across
+/// the last `builds_window` builds with no from-cache or up-to-date outcome,
+/// ordered by total execution time descending (= potential savings).
+pub fn never_cached_tasks(
+    conn: &Connection,
+    builds_window: usize,
+    min_executions: i64,
+    limit: usize,
+) -> Result<Vec<NeverCachedRow>> {
+    conn.prepare(
+        "WITH recent AS (SELECT id FROM builds ORDER BY created_at DESC, id DESC LIMIT ?1)
+         SELECT t.path,
+                SUM(t.outcome IN ('success', 'failed')) AS executions,
+                SUM(CASE WHEN t.outcome IN ('success', 'failed') THEN t.duration_ms ELSE 0 END)
+                    AS total_ms
+         FROM task_executions t JOIN recent ON t.build_id = recent.id
+         GROUP BY t.path
+         HAVING executions >= ?2 AND SUM(t.outcome IN ('from-cache', 'up-to-date')) = 0
+         ORDER BY total_ms DESC, t.path
+         LIMIT ?3",
+    )?
+    .query_map(
+        params![builds_window as i64, min_executions, limit as i64],
+        |r| {
+            Ok(NeverCachedRow {
+                path: r.get(0)?,
+                executions: r.get(1)?,
+                total_ms: r.get(2)?,
+            })
+        },
+    )?
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -765,6 +932,139 @@ mod tests {
             .unwrap();
         assert_eq!(builds_left, 1);
         assert_eq!(tasks_left, 0);
+    }
+
+    #[test]
+    fn cache_upsert_touch_and_totals() {
+        let conn = mem();
+        cache_upsert(&conn, "a".repeat(32).as_str(), 100).unwrap();
+        cache_upsert(&conn, "b".repeat(32).as_str(), 200).unwrap();
+        assert_eq!(cache_totals(&conn).unwrap(), (2, 300));
+        // hit counted on GET, not on HEAD
+        assert!(cache_touch(&conn, &"a".repeat(32), true).unwrap());
+        assert!(cache_touch(&conn, &"a".repeat(32), false).unwrap());
+        assert!(!cache_touch(&conn, &"c".repeat(32), true).unwrap());
+        let top = cache_top_entries(&conn, 10).unwrap();
+        assert_eq!(top[0].key, "a".repeat(32));
+        assert_eq!(top[0].hit_count, 1);
+        // overwrite keeps the hit count, refreshes size
+        cache_upsert(&conn, "a".repeat(32).as_str(), 150).unwrap();
+        let top = cache_top_entries(&conn, 10).unwrap();
+        assert_eq!(top[0].hit_count, 1);
+        assert_eq!(top[0].size, 150);
+        cache_remove(&conn, &"a".repeat(32)).unwrap();
+        assert_eq!(cache_totals(&conn).unwrap(), (1, 200));
+    }
+
+    #[test]
+    fn cache_evicts_least_recently_accessed_first() {
+        let conn = mem();
+        for (key, age_days) in [("a", 3), ("b", 2), ("c", 1)] {
+            cache_upsert(&conn, key.repeat(32).as_str(), 100).unwrap();
+            conn.execute(
+                "UPDATE cache_entries SET last_accessed_at = datetime('now', ?1) WHERE key = ?2",
+                params![format!("-{age_days} days"), key.repeat(32)],
+            )
+            .unwrap();
+        }
+        cache_upsert(&conn, "d".repeat(32).as_str(), 100).unwrap();
+        // fits: nothing evicted
+        assert!(
+            cache_evict_lru(&conn, 400, &"d".repeat(32))
+                .unwrap()
+                .is_empty()
+        );
+        // oldest-accessed go first, the just-written key is never evicted
+        let evicted = cache_evict_lru(&conn, 200, &"d".repeat(32)).unwrap();
+        assert_eq!(evicted, vec!["a".repeat(32), "b".repeat(32)]);
+        let evicted = cache_evict_lru(&conn, 0, &"d".repeat(32)).unwrap();
+        assert_eq!(evicted, vec!["c".repeat(32)]);
+        assert_eq!(cache_keys(&conn).unwrap(), vec!["d".repeat(32)]);
+    }
+
+    #[test]
+    fn cache_prune_expired_removes_only_stale_entries() {
+        let conn = mem();
+        cache_upsert(&conn, "a".repeat(32).as_str(), 100).unwrap();
+        cache_upsert(&conn, "b".repeat(32).as_str(), 100).unwrap();
+        conn.execute(
+            "UPDATE cache_entries SET last_accessed_at = datetime('now', '-40 days')
+             WHERE key = ?1",
+            [&"a".repeat(32)],
+        )
+        .unwrap();
+        let pruned = cache_prune_expired(&conn, 30).unwrap();
+        assert_eq!(pruned, vec!["a".repeat(32)]);
+        assert_eq!(cache_keys(&conn).unwrap(), vec!["b".repeat(32)]);
+    }
+
+    #[test]
+    fn cache_hit_totals_count_work_needed_only() {
+        let mut conn = mem();
+        ingest_build(
+            &mut conn,
+            &build_payload(
+                "b1",
+                vec![
+                    (":a", TaskOutcome::FromCache),
+                    (":b", TaskOutcome::Success),
+                    (":c", TaskOutcome::Failed),
+                    (":d", TaskOutcome::UpToDate),
+                    (":e", TaskOutcome::Skipped),
+                ],
+            ),
+        )
+        .unwrap();
+        // up-to-date and skipped are excluded from the denominator
+        assert_eq!(cache_hit_totals(&conn).unwrap(), (1, 3));
+    }
+
+    #[test]
+    fn never_cached_requires_executions_and_no_cache_outcomes() {
+        let mut conn = mem();
+        for i in 0..3 {
+            ingest_build(
+                &mut conn,
+                &build_payload(
+                    &format!("b{i}"),
+                    vec![
+                        (":never", TaskOutcome::Success),
+                        (
+                            ":sometimes",
+                            if i == 0 {
+                                TaskOutcome::FromCache
+                            } else {
+                                TaskOutcome::Success
+                            },
+                        ),
+                        (
+                            ":upToDate",
+                            if i == 0 {
+                                TaskOutcome::UpToDate
+                            } else {
+                                TaskOutcome::Success
+                            },
+                        ),
+                        (
+                            ":rare",
+                            if i == 0 {
+                                TaskOutcome::Success
+                            } else {
+                                TaskOutcome::Skipped
+                            },
+                        ),
+                    ],
+                ),
+            )
+            .unwrap();
+        }
+        let rows = never_cached_tasks(&conn, 100, 3, 50).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, ":never");
+        assert_eq!(rows[0].executions, 3);
+        assert_eq!(rows[0].total_ms, 30);
+        // shrinking the window below the qualifying executions drops the signal
+        assert!(never_cached_tasks(&conn, 2, 3, 50).unwrap().is_empty());
     }
 
     #[test]

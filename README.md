@@ -1,6 +1,6 @@
 # lightning
 
-lightning is a self-hosted, open-source observability and acceleration platform for Gradle CI (Android monorepos first): a layer above the build, never inside it (see `docs/design/lightning-platform.md`). It currently ships two features: a **flaky-test radar** (a CLI uploads JUnit XML results from CI; the server tracks test history, computes deterministic flaky scores, and shows what flakes, since when, and on which commit) and **build telemetry** ("build scans lite": a Gradle init script reports per-task timings, cache outcomes, and configuration/total build time to the same server).
+lightning is a self-hosted, open-source observability and acceleration platform for Gradle CI (Android monorepos first): a layer above the build, never inside it (see `docs/design/lightning-platform.md`). It currently ships three features: a **flaky-test radar** (a CLI uploads JUnit XML results from CI; the server tracks test history, computes deterministic flaky scores, and shows what flakes, since when, and on which commit), **build telemetry** ("build scans lite": a Gradle init script reports per-task timings, cache outcomes, and configuration/total build time to the same server), and a **remote Gradle build cache** with analytics (the server speaks Gradle's HTTP build cache protocol and shows hit rates, storage stats, and never-cached tasks on top of the telemetry).
 
 ## Run the server
 
@@ -9,7 +9,7 @@ cargo build --release
 ./target/release/lightning-server --addr 0.0.0.0:8080 --db lightning.db --retention-days 90
 ```
 
-Flags are also available as env vars: `LIGHTNING_ADDR`, `LIGHTNING_DB`, `LIGHTNING_RETENTION_DAYS`. The UI is at `/` (flaky list), `/tests/{id}` (test history), `/runs/{id}` (run summary), `/builds` (builds list), `/builds/{id}` (build detail), `/trends` (per-branch build trends); JSON at `/api/flaky` and `/api/builds`.
+Flags are also available as env vars: `LIGHTNING_ADDR`, `LIGHTNING_DB`, `LIGHTNING_RETENTION_DAYS`. The UI is at `/` (flaky list), `/tests/{id}` (test history), `/runs/{id}` (run summary), `/builds` (builds list), `/builds/{id}` (build detail), `/trends` (per-branch build trends), `/cache` (cache storage and analytics); JSON at `/api/flaky` and `/api/builds`.
 
 ## Add upload to CI
 
@@ -38,3 +38,25 @@ Extract the embedded Gradle init script and attach it to your build:
 ```
 
 The script collects per-task timings and outcomes (success / up-to-date / from-cache / failed / skipped), configuration and total build time, requested tasks, Gradle/JDK versions, and git/CI metadata, then POSTs one JSON document to `/api/builds` when the build finishes. The server URL comes from the `lightning.url` Gradle property (`-Plightning.url=...`) or the `LIGHTNING_URL` env var. Telemetry is fail-safe: without a URL it does nothing, and any error is logged and swallowed — it never breaks the build.
+
+## Use the remote build cache
+
+The server implements Gradle's HTTP build cache protocol at `/cache/{key}`. Enable it in `settings.gradle(.kts)` — push from CI, pull everywhere:
+
+```groovy
+// settings.gradle
+buildCache {
+    remote(HttpBuildCache) {
+        url = 'https://lightning.example.com/cache/'   // trailing slash required
+        push = System.getenv('CI') != null
+        credentials {
+            username = 'ci'                            // ignored by the server
+            password = System.getenv('LIGHTNING_CACHE_TOKEN') ?: ''
+        }
+    }
+}
+```
+
+Run builds with `--build-cache` (or `org.gradle.caching=true`). Storage is bounded and self-maintaining: artifacts land in a directory next to the db (`--cache-dir` / `LIGHTNING_CACHE_DIR`), single artifacts over 100 MiB are rejected (`--cache-max-artifact-mb`), the total is capped at 10 GiB with least-recently-used eviction (`--cache-max-size-mb`), and entries unused for 30 days are pruned (`--cache-retention-days`).
+
+Writes can be protected with a shared token: start the server with `LIGHTNING_CACHE_TOKEN=<secret>` (or `--cache-token`) and give CI the same value — Gradle sends it as the Basic-auth password, the username is ignored. Reads stay open; without a token, writes are open too. Cache analytics (hit rate, top artifacts, never-cached task paths) live at `/cache` and improve as build telemetry accumulates.

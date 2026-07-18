@@ -14,7 +14,7 @@ use crate::score::{Score, Verdict, WindowEntry, score};
 pub const WINDOW: usize = 50;
 const TREND_LEN: usize = 20;
 
-fn internal(e: rusqlite::Error) -> StatusCode {
+pub(crate) fn internal(e: rusqlite::Error) -> StatusCode {
     eprintln!("db error: {e}");
     StatusCode::INTERNAL_SERVER_ERROR
 }
@@ -137,7 +137,7 @@ nav {{ margin-bottom: 1rem; }} nav a {{ margin-right: .8rem; }}
 </head>
 <body>
 <h1><a href="/">lightning</a> · {title}</h1>
-<nav><a href="/">flaky</a><a href="/builds">builds</a><a href="/trends">trends</a></nav>
+<nav><a href="/">flaky</a><a href="/builds">builds</a><a href="/trends">trends</a><a href="/cache">cache</a></nav>
 {body}
 </body>
 </html>
@@ -319,6 +319,29 @@ fn fmt_ms(ms: i64) -> String {
     }
 }
 
+fn fmt_bytes(bytes: i64) -> String {
+    const KIB: f64 = 1024.0;
+    let b = bytes as f64;
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if b < KIB * KIB {
+        format!("{:.1} KiB", b / KIB)
+    } else if b < KIB * KIB * KIB {
+        format!("{:.1} MiB", b / KIB / KIB)
+    } else {
+        format!("{:.2} GiB", b / KIB / KIB / KIB)
+    }
+}
+
+/// from-cache share of tasks that needed work; "—" when none did.
+fn hit_rate_cell(from_cache: i64, work: i64) -> String {
+    if work == 0 {
+        "—".to_string()
+    } else {
+        format!("{}%", from_cache * 100 / work)
+    }
+}
+
 fn avoided_cell(b: &BuildRow) -> String {
     if b.tasks == 0 {
         return "—".to_string();
@@ -416,7 +439,7 @@ pub async fn build_page(
 <p class="muted">{versions} · build key <code>{key}</code></p>
 <p>Outcome: <span class="outcome {outcome}">{outcome}</span> · tasks <code>{tasks}</code></p>
 <p>Total {total} · configuration {config} · execution {exec}</p>
-<p>{success} success · {up_to_date} up-to-date · {from_cache} from-cache · {failed} failed · {skipped} skipped · avoided {avoided}</p>
+<p>{success} success · {up_to_date} up-to-date · {from_cache} from-cache · {failed} failed · {skipped} skipped · avoided {avoided} · cache hit rate {hit_rate}</p>
 {slowest}"#,
         sha = short_sha(b.sha.as_deref()),
         branch = esc(b.branch.as_deref().unwrap_or("—")),
@@ -438,8 +461,104 @@ pub async fn build_page(
         failed = b.failed,
         skipped = b.skipped,
         avoided = avoided_cell(&b),
+        hit_rate = hit_rate_cell(b.from_cache, b.from_cache + b.success + b.failed),
     );
     Ok(page(&format!("build #{id}"), &body))
+}
+
+const TOP_ARTIFACTS: usize = 20;
+const NEVER_CACHED_WINDOW: usize = 100;
+const NEVER_CACHED_MIN_EXECUTIONS: i64 = 3;
+const NEVER_CACHED_LIMIT: usize = 50;
+
+pub async fn cache_page(State(app): State<Arc<App>>) -> Result<Html<String>, StatusCode> {
+    let conn = app.db.lock().unwrap();
+    let (entries, total) = db::cache_totals(&conn).map_err(internal)?;
+    let top = db::cache_top_entries(&conn, TOP_ARTIFACTS).map_err(internal)?;
+    let (from_cache, work) = db::cache_hit_totals(&conn).map_err(internal)?;
+    let never = db::never_cached_tasks(
+        &conn,
+        NEVER_CACHED_WINDOW,
+        NEVER_CACHED_MIN_EXECUTIONS,
+        NEVER_CACHED_LIMIT,
+    )
+    .map_err(internal)?;
+    drop(conn);
+    let auth = if app.cache.token.is_some() {
+        " · writes token-protected"
+    } else {
+        " · writes open"
+    };
+    let storage = format!(
+        "<p>{entries} entries · {used} used of {cap} · artifact limit {alim} · \
+retention {days} days{auth}</p>",
+        used = fmt_bytes(total),
+        cap = fmt_bytes(app.cache.max_total_bytes),
+        alim = fmt_bytes(app.cache.max_artifact_bytes as i64),
+        days = app.cache.retention_days,
+    );
+    let hit_rate = if work == 0 {
+        "<p>No task telemetry yet — overall hit rate unavailable.</p>".to_string()
+    } else {
+        format!(
+            "<p>Overall task cache hit rate: <span class=\"score\">{rate}</span> \
+({from_cache} from-cache of {work} tasks that needed work, all retained builds).
+<span class=\"muted\">The denominator includes non-cacheable tasks, so the achievable rate is higher.</span></p>",
+            rate = hit_rate_cell(from_cache, work),
+        )
+    };
+    let artifacts = if top.is_empty() {
+        "<p>Cache is empty.</p>".to_string()
+    } else {
+        let rows: String = top
+            .iter()
+            .map(|e| {
+                format!(
+                    r#"<tr><td><code>{key}</code></td><td class="num">{size}</td><td class="num">{hits}</td>
+<td class="muted">{created}</td><td class="muted">{accessed}</td></tr>"#,
+                    key = esc(&e.key),
+                    size = fmt_bytes(e.size),
+                    hits = e.hit_count,
+                    created = esc(&e.created_at),
+                    accessed = esc(&e.last_accessed_at),
+                )
+            })
+            .collect();
+        format!(
+            "<h2>Top artifacts by hits (top {TOP_ARTIFACTS})</h2>\
+<table><tr><th>Key</th><th class=\"num\">Size</th><th class=\"num\">Hits</th>\
+<th>Created (UTC)</th><th>Last accessed (UTC)</th></tr>{rows}</table>"
+        )
+    };
+    let never_cached = if never.is_empty() {
+        "<p>No never-cached task paths detected.</p>".to_string()
+    } else {
+        let rows: String = never
+            .iter()
+            .map(|t| {
+                format!(
+                    r#"<tr><td><code>{path}</code></td><td class="num">{execs}</td><td class="num">{total}</td></tr>"#,
+                    path = esc(&t.path),
+                    execs = t.executions,
+                    total = fmt_ms(t.total_ms),
+                )
+            })
+            .collect();
+        format!(
+            "<table><tr><th>Task path</th><th class=\"num\">Executions</th>\
+<th class=\"num\">Total execution time</th></tr>{rows}</table>"
+        )
+    };
+    let body = format!(
+        "{storage}{hit_rate}{artifacts}\
+<h2>Never-cached task paths</h2>\
+<p class=\"muted\">Task paths executed in at least {NEVER_CACHED_MIN_EXECUTIONS} of the last \
+{NEVER_CACHED_WINDOW} builds and never from-cache or up-to-date, by total execution time. \
+Weak signal: telemetry has no machine identity, so tasks whose inputs change every build are \
+indistinguishable from uncacheable tasks — a starting point for investigation, not a verdict.</p>\
+{never_cached}"
+    );
+    Ok(page("build cache", &body))
 }
 
 fn median(mut values: Vec<i64>) -> Option<i64> {
