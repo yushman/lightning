@@ -16,6 +16,15 @@ struct Cli {
 enum Command {
     /// Parse JUnit XML reports and upload a test run to the lightning server
     Upload(UploadArgs),
+    /// Emit the embedded Gradle telemetry init script
+    InitScript(InitScriptArgs),
+}
+
+#[derive(Args)]
+struct InitScriptArgs {
+    /// Write the script to this path instead of stdout
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
 }
 
 #[derive(Args)]
@@ -46,13 +55,30 @@ struct RunPayload<'a> {
     results: &'a [TestResult],
 }
 
+const INIT_SCRIPT: &str = include_str!("../assets/lightning.init.gradle");
+
 fn main() {
     let cli = Cli::parse();
-    let Command::Upload(args) = cli.command;
-    if let Err(err) = upload(args) {
+    let result = match cli.command {
+        Command::Upload(args) => upload(args),
+        Command::InitScript(args) => init_script(args),
+    };
+    if let Err(err) = result {
         eprintln!("error: {err}");
         std::process::exit(1);
     }
+}
+
+fn init_script(args: InitScriptArgs) -> Result<(), String> {
+    match args.out {
+        Some(path) => {
+            std::fs::write(&path, INIT_SCRIPT)
+                .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+            println!("wrote init script to {}", path.display());
+        }
+        None => print!("{INIT_SCRIPT}"),
+    }
+    Ok(())
 }
 
 fn collect_results(pattern: &str) -> Result<Vec<TestResult>, String> {
@@ -102,4 +128,24 @@ fn upload(args: UploadArgs) -> Result<(), String> {
         println!("uploaded {} results as run {run_id}", results.len());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_script_writes_embedded_asset() {
+        let path =
+            std::env::temp_dir().join(format!("lightning-init-{}.gradle", std::process::id()));
+        init_script(InitScriptArgs {
+            out: Some(path.clone()),
+        })
+        .unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(written, INIT_SCRIPT);
+        assert!(written.contains("LightningTelemetryService"));
+        assert!(written.contains("/api/builds"));
+    }
 }

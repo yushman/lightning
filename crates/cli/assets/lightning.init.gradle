@@ -1,0 +1,194 @@
+// lightning build telemetry init script ("build scans lite").
+// Attach with: gradle --init-script lightning.init.gradle
+// Server URL: -Plightning.url=<url> (or gradle.properties) or LIGHTNING_URL env var.
+// Fail-safe by design: telemetry never breaks or fails the build.
+
+import java.util.concurrent.TimeUnit
+import javax.inject.Inject
+
+import org.gradle.api.Plugin
+import org.gradle.api.invocation.Gradle
+import org.gradle.api.provider.Property
+import org.gradle.api.services.BuildService
+import org.gradle.api.services.BuildServiceParameters
+import org.gradle.build.event.BuildEventsListenerRegistry
+import org.gradle.tooling.events.FinishEvent
+import org.gradle.tooling.events.OperationCompletionListener
+import org.gradle.tooling.events.task.TaskFailureResult
+import org.gradle.tooling.events.task.TaskFinishEvent
+import org.gradle.tooling.events.task.TaskSkippedResult
+import org.gradle.tooling.events.task.TaskSuccessResult
+
+abstract class LightningTelemetryService
+        implements BuildService<Params>, OperationCompletionListener, AutoCloseable {
+
+    interface Params extends BuildServiceParameters {
+        Property<Long> getBuildStartMs()
+        Property<String> getServerUrl()
+        Property<String> getRequestedTasks()
+        Property<String> getGradleVersion()
+        Property<String> getInvocationDir()
+    }
+
+    private final List<Map<String, Object>> tasks =
+            Collections.synchronizedList(new ArrayList<Map<String, Object>>())
+
+    @Override
+    void onFinish(FinishEvent event) {
+        try {
+            if (!(event instanceof TaskFinishEvent)) {
+                return
+            }
+            def result = event.result
+            String outcome
+            if (result instanceof TaskFailureResult) {
+                outcome = 'failed'
+            } else if (result instanceof TaskSkippedResult) {
+                outcome = 'skipped'
+            } else if (result instanceof TaskSuccessResult) {
+                // from-cache tasks also report up-to-date, so check from-cache first
+                outcome = result.fromCache ? 'from-cache' : (result.upToDate ? 'up-to-date' : 'success')
+            } else {
+                return
+            }
+            tasks.add([
+                path   : event.descriptor.taskPath,
+                outcome: outcome,
+                startMs: result.startTime,
+                endMs  : result.endTime,
+            ])
+        } catch (Throwable ignored) {
+            // never let telemetry interfere with the build
+        }
+    }
+
+    @Override
+    void close() {
+        try {
+            publish()
+        } catch (Throwable t) {
+            System.err.println("lightning: telemetry publish failed: ${t}")
+        }
+    }
+
+    private void publish() {
+        String url = parameters.serverUrl.getOrElse('')
+        if (!url) {
+            url = System.getenv('LIGHTNING_URL') ?: ''
+        }
+        if (!url) {
+            println 'lightning: no server url (-Plightning.url or LIGHTNING_URL), telemetry skipped'
+            return
+        }
+        long now = System.currentTimeMillis()
+        long buildStart = parameters.buildStartMs.get()
+        List<Map<String, Object>> snapshot
+        synchronized (tasks) {
+            snapshot = new ArrayList<>(tasks)
+        }
+        long configurationMs = 0
+        if (!snapshot.isEmpty()) {
+            long firstStart = snapshot.collect { (long) it.startMs }.min()
+            configurationMs = Math.max(0L, firstStart - buildStart)
+        }
+        boolean failed = snapshot.any { it.outcome == 'failed' }
+        def payload = [
+            build_key       : UUID.randomUUID().toString(),
+            sha             : env('GITHUB_SHA') ?: git('rev-parse', 'HEAD'),
+            branch          : env('GITHUB_HEAD_REF') ?: env('GITHUB_REF_NAME')
+                    ?: git('rev-parse', '--abbrev-ref', 'HEAD'),
+            ci_url          : ciUrl(),
+            outcome         : failed ? 'failed' : 'success',
+            requested_tasks : parameters.requestedTasks.get(),
+            gradle_version  : parameters.gradleVersion.get(),
+            java_version    : System.getProperty('java.version'),
+            total_ms        : Math.max(0L, now - buildStart),
+            configuration_ms: configurationMs,
+            tasks           : snapshot.collect {
+                [
+                    path       : it.path,
+                    outcome    : it.outcome,
+                    duration_ms: Math.max(0L, ((long) it.endMs) - ((long) it.startMs)),
+                ]
+            },
+        ]
+        post(url, groovy.json.JsonOutput.toJson(payload))
+    }
+
+    private void post(String baseUrl, String json) {
+        def url = new URL(baseUrl.replaceAll('/+$', '') + '/api/builds')
+        def conn = (HttpURLConnection) url.openConnection()
+        conn.connectTimeout = 5000
+        conn.readTimeout = 10000
+        conn.requestMethod = 'POST'
+        conn.doOutput = true
+        conn.setRequestProperty('Content-Type', 'application/json')
+        try {
+            conn.outputStream.withStream { it.write(json.getBytes('UTF-8')) }
+            int code = conn.responseCode
+            if (code >= 200 && code < 300) {
+                println "lightning: build telemetry sent (${code})"
+            } else {
+                System.err.println("lightning: server responded ${code}, telemetry dropped")
+            }
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    private static String env(String name) {
+        def v = System.getenv(name)
+        (v != null && !v.isEmpty()) ? v : null
+    }
+
+    private static String ciUrl() {
+        def server = env('GITHUB_SERVER_URL')
+        def repo = env('GITHUB_REPOSITORY')
+        def runId = env('GITHUB_RUN_ID')
+        (server && repo && runId) ? "${server}/${repo}/actions/runs/${runId}".toString() : null
+    }
+
+    private String git(String... args) {
+        try {
+            def cmd = ['git']
+            cmd.addAll(args as List)
+            def p = new ProcessBuilder(cmd)
+                    .directory(new File(parameters.invocationDir.get()))
+                    .start()
+            if (!p.waitFor(2, TimeUnit.SECONDS)) {
+                p.destroyForcibly()
+                return null
+            }
+            def out = p.inputStream.text.trim()
+            (p.exitValue() == 0 && !out.isEmpty()) ? out : null
+        } catch (Throwable ignored) {
+            null
+        }
+    }
+}
+
+abstract class LightningTelemetryPlugin implements Plugin<Gradle> {
+
+    @Inject
+    abstract BuildEventsListenerRegistry getEventsListenerRegistry()
+
+    @Override
+    void apply(Gradle gradle) {
+        def service = gradle.sharedServices.registerIfAbsent(
+                'lightningTelemetry', LightningTelemetryService) { spec ->
+            spec.parameters.buildStartMs.set(System.currentTimeMillis())
+            spec.parameters.serverUrl.set(
+                    gradle.startParameter.projectProperties['lightning.url'] ?: '')
+            spec.parameters.requestedTasks.set(gradle.startParameter.taskNames.join(' '))
+            spec.parameters.gradleVersion.set(gradle.gradleVersion)
+            spec.parameters.invocationDir.set(gradle.startParameter.currentDir.absolutePath)
+        }
+        eventsListenerRegistry.onTaskCompletion(service)
+    }
+}
+
+try {
+    apply plugin: LightningTelemetryPlugin
+} catch (Throwable t) {
+    System.err.println("lightning: telemetry disabled: ${t}")
+}

@@ -47,8 +47,12 @@ async fn main() {
         .route("/", get(web::flaky_page))
         .route("/tests/{id}", get(web::test_page))
         .route("/runs/{id}", get(web::run_page))
+        .route("/builds", get(web::builds_page))
+        .route("/builds/{id}", get(web::build_page))
+        .route("/trends", get(web::trends_page))
         .route("/api/runs", post(web::ingest))
         .route("/api/flaky", get(web::flaky_api))
+        .route("/api/builds", post(web::ingest_build).get(web::builds_api))
         .with_state(app);
     let listener = tokio::net::TcpListener::bind(&args.addr)
         .await

@@ -8,7 +8,7 @@ use axum::response::Html;
 use serde_json::json;
 
 use crate::App;
-use crate::db::{self, RunPayload, TestRow, VerdictRow};
+use crate::db::{self, BuildPayload, BuildRow, RunPayload, TestRow, VerdictRow};
 use crate::score::{Score, Verdict, WindowEntry, score};
 
 pub const WINDOW: usize = 50;
@@ -129,10 +129,15 @@ code {{ font-size: .85em; background: #f2f2f2; padding: .1em .3em; border-radius
 .v.pass {{ background: #2da44e; }} .v.fail {{ background: #cf222e; }} .v.mixed {{ background: #d4a72c; }}
 .verdict.pass {{ color: #2da44e; }} .verdict.fail {{ color: #cf222e; }} .verdict.mixed {{ color: #b08800; }}
 .muted {{ color: #666; }}
+nav {{ margin-bottom: 1rem; }} nav a {{ margin-right: .8rem; }}
+.outcome.success {{ color: #2da44e; }} .outcome.failed {{ color: #cf222e; }}
+.bar {{ display: inline-block; height: .7em; background: #54aeff; border-radius: 2px; vertical-align: middle; }}
+.num {{ text-align: right; }}
 </style>
 </head>
 <body>
 <h1><a href="/">lightning</a> · {title}</h1>
+<nav><a href="/">flaky</a><a href="/builds">builds</a><a href="/trends">trends</a></nav>
 {body}
 </body>
 </html>
@@ -242,6 +247,284 @@ pub async fn test_page(
         window_len = window.len(),
     );
     Ok(page("test history", &body))
+}
+
+const BUILDS_LIMIT: usize = 100;
+const SLOWEST_TASKS: usize = 20;
+const TREND_WINDOW: usize = 50;
+const TREND_FETCH: usize = 500;
+
+pub async fn ingest_build(
+    State(app): State<Arc<App>>,
+    payload: Result<Json<BuildPayload>, JsonRejection>,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    let Ok(Json(payload)) = payload else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    if payload.build_key.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut conn = app.db.lock().unwrap();
+    let (build_id, deduplicated) = db::ingest_build(&mut conn, &payload).map_err(internal)?;
+    db::prune(&conn, app.retention_days).map_err(internal)?;
+    let status = if deduplicated {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((
+        status,
+        Json(json!({ "build_id": build_id, "deduplicated": deduplicated })),
+    ))
+}
+
+pub async fn builds_api(
+    State(app): State<Arc<App>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let conn = app.db.lock().unwrap();
+    let builds = db::builds(&conn, BUILDS_LIMIT).map_err(internal)?;
+    let items: Vec<serde_json::Value> = builds
+        .iter()
+        .map(|b| {
+            json!({
+                "build_id": b.id,
+                "build_key": b.build_key,
+                "sha": b.sha,
+                "branch": b.branch,
+                "outcome": b.outcome,
+                "total_ms": b.total_ms,
+                "configuration_ms": b.configuration_ms,
+                "created_at": b.created_at,
+                "tasks": {
+                    "total": b.tasks,
+                    "success": b.success,
+                    "up-to-date": b.up_to_date,
+                    "from-cache": b.from_cache,
+                    "failed": b.failed,
+                    "skipped": b.skipped,
+                },
+            })
+        })
+        .collect();
+    Ok(Json(json!(items)))
+}
+
+fn fmt_ms(ms: i64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{}m {}s", ms / 60_000, (ms % 60_000) / 1000)
+    }
+}
+
+fn avoided_cell(b: &BuildRow) -> String {
+    if b.tasks == 0 {
+        return "—".to_string();
+    }
+    format!(
+        "{}/{} ({}%)",
+        b.avoided(),
+        b.tasks,
+        b.avoided() * 100 / b.tasks
+    )
+}
+
+fn short_sha(sha: Option<&str>) -> String {
+    match sha {
+        Some(s) => esc(&s[..s.len().min(9)]),
+        None => "—".to_string(),
+    }
+}
+
+pub async fn builds_page(State(app): State<Arc<App>>) -> Result<Html<String>, StatusCode> {
+    let conn = app.db.lock().unwrap();
+    let builds = db::builds(&conn, BUILDS_LIMIT).map_err(internal)?;
+    if builds.is_empty() {
+        return Ok(page("builds", "<p>No builds recorded yet.</p>"));
+    }
+    let rows: String = builds
+        .iter()
+        .map(|b| {
+            format!(
+                r#"<tr><td class="muted">{time}</td><td>{branch}</td><td><code>{sha}</code></td>
+<td class="outcome {outcome}">{outcome}</td><td><a href="/builds/{id}"><code>{tasks}</code></a></td>
+<td class="num">{duration}</td><td class="num">{avoided}</td></tr>"#,
+                time = esc(&b.created_at),
+                branch = esc(b.branch.as_deref().unwrap_or("—")),
+                sha = short_sha(b.sha.as_deref()),
+                outcome = esc(&b.outcome),
+                id = b.id,
+                tasks = esc(if b.requested_tasks.is_empty() {
+                    "(default)"
+                } else {
+                    &b.requested_tasks
+                }),
+                duration = fmt_ms(b.total_ms),
+                avoided = avoided_cell(b),
+            )
+        })
+        .collect();
+    let body = format!(
+        "<table><tr><th>Time (UTC)</th><th>Branch</th><th>SHA</th><th>Outcome</th>\
+<th>Tasks</th><th class=\"num\">Duration</th><th class=\"num\">Avoided</th></tr>{rows}</table>"
+    );
+    Ok(page("builds", &body))
+}
+
+pub async fn build_page(
+    State(app): State<Arc<App>>,
+    Path(id): Path<i64>,
+) -> Result<Html<String>, StatusCode> {
+    let conn = app.db.lock().unwrap();
+    let b = db::build(&conn, id)
+        .map_err(internal)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let tasks = db::build_tasks(&conn, id, SLOWEST_TASKS).map_err(internal)?;
+    let ci = b
+        .ci_url
+        .as_deref()
+        .map(|u| format!(r#" · <a href="{0}">CI run</a>"#, esc(u)))
+        .unwrap_or_default();
+    let versions = format!(
+        "Gradle {} · JDK {}",
+        esc(b.gradle_version.as_deref().unwrap_or("?")),
+        esc(b.java_version.as_deref().unwrap_or("?")),
+    );
+    let slowest: String = tasks
+        .iter()
+        .map(|t| {
+            format!(
+                r#"<tr><td><code>{path}</code></td><td>{outcome}</td><td class="num">{duration}</td></tr>"#,
+                path = esc(&t.path),
+                outcome = esc(&t.outcome),
+                duration = fmt_ms(t.duration_ms),
+            )
+        })
+        .collect();
+    let slowest = if slowest.is_empty() {
+        "<p>No tasks executed.</p>".to_string()
+    } else {
+        format!(
+            "<h2>Slowest tasks (top {SLOWEST_TASKS})</h2>\
+<table><tr><th>Task</th><th>Outcome</th><th class=\"num\">Duration</th></tr>{slowest}</table>"
+        )
+    };
+    let body = format!(
+        r#"<p><code>{sha}</code> on <b>{branch}</b> · {time} UTC{ci}</p>
+<p class="muted">{versions} · build key <code>{key}</code></p>
+<p>Outcome: <span class="outcome {outcome}">{outcome}</span> · tasks <code>{tasks}</code></p>
+<p>Total {total} · configuration {config} · execution {exec}</p>
+<p>{success} success · {up_to_date} up-to-date · {from_cache} from-cache · {failed} failed · {skipped} skipped · avoided {avoided}</p>
+{slowest}"#,
+        sha = short_sha(b.sha.as_deref()),
+        branch = esc(b.branch.as_deref().unwrap_or("—")),
+        time = esc(&b.created_at),
+        versions = versions,
+        key = esc(&b.build_key),
+        outcome = esc(&b.outcome),
+        tasks = esc(if b.requested_tasks.is_empty() {
+            "(default)"
+        } else {
+            &b.requested_tasks
+        }),
+        total = fmt_ms(b.total_ms),
+        config = fmt_ms(b.configuration_ms),
+        exec = fmt_ms((b.total_ms - b.configuration_ms).max(0)),
+        success = b.success,
+        up_to_date = b.up_to_date,
+        from_cache = b.from_cache,
+        failed = b.failed,
+        skipped = b.skipped,
+        avoided = avoided_cell(&b),
+    );
+    Ok(page(&format!("build #{id}"), &body))
+}
+
+fn median(mut values: Vec<i64>) -> Option<i64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    Some(values[values.len() / 2])
+}
+
+pub async fn trends_page(State(app): State<Arc<App>>) -> Result<Html<String>, StatusCode> {
+    let conn = app.db.lock().unwrap();
+    let builds = db::builds(&conn, TREND_FETCH).map_err(internal)?;
+    if builds.is_empty() {
+        return Ok(page("trends", "<p>No builds recorded yet.</p>"));
+    }
+    // group newest-first builds per branch, keeping the recent window
+    let mut branches: Vec<(String, Vec<&BuildRow>)> = Vec::new();
+    for b in &builds {
+        let name = b.branch.as_deref().unwrap_or("(unknown)").to_string();
+        match branches.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, list)) if list.len() < TREND_WINDOW => list.push(b),
+            Some(_) => {}
+            None => branches.push((name, vec![b])),
+        }
+    }
+    struct Trend {
+        branch: String,
+        count: usize,
+        median_ms: Option<i64>,
+        median_avoided_pct: Option<i64>,
+    }
+    let trends: Vec<Trend> = branches
+        .iter()
+        .map(|(name, list)| {
+            let durations: Vec<i64> = list
+                .iter()
+                .filter(|b| b.outcome == "success")
+                .map(|b| b.total_ms)
+                .collect();
+            let avoided: Vec<i64> = list
+                .iter()
+                .filter(|b| b.tasks > 0)
+                .map(|b| b.avoided() * 100 / b.tasks)
+                .collect();
+            Trend {
+                branch: name.clone(),
+                count: list.len(),
+                median_ms: median(durations),
+                median_avoided_pct: median(avoided),
+            }
+        })
+        .collect();
+    let max_ms = trends.iter().filter_map(|t| t.median_ms).max().unwrap_or(0);
+    let rows: String = trends
+        .iter()
+        .map(|t| {
+            let (duration, bar) = match t.median_ms {
+                Some(ms) => (
+                    fmt_ms(ms),
+                    format!(
+                        r#"<span class="bar" style="width:{}px"></span>"#,
+                        (ms * 200 / max_ms.max(1)).max(2)
+                    ),
+                ),
+                None => ("—".to_string(), String::new()),
+            };
+            let avoided = t
+                .median_avoided_pct
+                .map(|p| format!("{p}%"))
+                .unwrap_or_else(|| "—".to_string());
+            format!(
+                r#"<tr><td>{branch}</td><td class="num">{count}</td><td class="num">{duration}</td>
+<td>{bar}</td><td class="num">{avoided}</td></tr>"#,
+                branch = esc(&t.branch),
+                count = t.count,
+            )
+        })
+        .collect();
+    let body = format!(
+        "<p class=\"muted\">Per branch over its last {TREND_WINDOW} builds; median duration counts successful builds only.</p>\
+<table><tr><th>Branch</th><th class=\"num\">Builds</th><th class=\"num\">Median duration</th>\
+<th></th><th class=\"num\">Median avoided</th></tr>{rows}</table>"
+    );
+    Ok(page("build trends", &body))
 }
 
 pub async fn run_page(
