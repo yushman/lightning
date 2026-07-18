@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::Json;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Html;
@@ -20,8 +21,12 @@ fn internal(e: rusqlite::Error) -> StatusCode {
 
 pub async fn ingest(
     State(app): State<Arc<App>>,
-    Json(payload): Json<RunPayload>,
+    payload: Result<Json<RunPayload>, JsonRejection>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    // The spec promises 400 for any malformed payload; axum's default is 422.
+    let Ok(Json(payload)) = payload else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
     if payload.run_key.is_empty() || payload.sha.is_empty() || payload.branch.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
