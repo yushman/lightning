@@ -1,0 +1,5 @@
+/target
+*.db
+*.sqlite
+.idea/
+.DS_Store
