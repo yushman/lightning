@@ -1,0 +1,15 @@
+// Simulates Android-style task naming without AGP: no java plugin, so no
+// `test` task; a registered task with a variant-like name instead.
+configurations {
+    tooling
+}
+
+dependencies {
+    tooling project(':core')
+}
+
+tasks.register('testDebugUnitTest') {
+    doLast {
+        println 'custom module tests'
+    }
+}

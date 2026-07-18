@@ -1,5 +1,12 @@
+mod affected;
+mod config;
+mod gitdiff;
 mod junit;
+mod lock;
 mod meta;
+mod paths;
+mod run;
+mod sync;
 
 use clap::{Args, Parser, Subcommand};
 
@@ -18,6 +25,12 @@ enum Command {
     Upload(UploadArgs),
     /// Emit the embedded Gradle telemetry init script
     InitScript(InitScriptArgs),
+    /// Snapshot the Gradle module graph into lightning.lock (runs Gradle once)
+    Sync,
+    /// List modules affected by the diff against the base ref (no JVM needed)
+    Affected(affected::AffectedArgs),
+    /// Run a Gradle task on affected modules only
+    Run(run::RunArgs),
 }
 
 #[derive(Args)]
@@ -60,13 +73,29 @@ const INIT_SCRIPT: &str = include_str!("../assets/lightning.init.gradle");
 fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Upload(args) => upload(args),
-        Command::InitScript(args) => init_script(args),
+        Command::Upload(args) => upload(args).map(|()| 0),
+        Command::InitScript(args) => init_script(args).map(|()| 0),
+        Command::Sync => sync_cmd(),
+        Command::Affected(args) => cwd().and_then(|dir| affected::run(&dir, &args)),
+        Command::Run(args) => cwd().and_then(|dir| run::run(&dir, &args)),
     };
-    if let Err(err) = result {
-        eprintln!("error: {err}");
-        std::process::exit(1);
+    match result {
+        Ok(code) => std::process::exit(code),
+        Err(err) => {
+            eprintln!("error: {err}");
+            std::process::exit(1);
+        }
     }
+}
+
+fn cwd() -> Result<std::path::PathBuf, String> {
+    std::env::current_dir().map_err(|e| format!("cannot determine working directory: {e}"))
+}
+
+fn sync_cmd() -> Result<i32, String> {
+    let dir = cwd()?;
+    let cfg = config::load(&dir)?.affected;
+    sync::run(&dir, &cfg.invalidate_on).map(|_| 0)
 }
 
 fn init_script(args: InitScriptArgs) -> Result<(), String> {

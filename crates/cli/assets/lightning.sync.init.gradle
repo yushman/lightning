@@ -1,0 +1,54 @@
+// lightning sync init script: dumps the project model for `lightning sync`.
+// The CLI attaches it with --init-script and passes the output path via
+// -Plightning.lock.dump=<path>. The dump is raw; the CLI normalizes and sorts.
+
+import groovy.json.JsonOutput
+import org.gradle.api.artifacts.ProjectDependency
+
+gradle.projectsEvaluated { g ->
+    if (g.parent != null) {
+        return // only the root build dumps; included builds are unsupported
+    }
+    String out = g.startParameter.projectProperties['lightning.lock.dump']
+    if (!out) {
+        return
+    }
+    def rootPath = g.rootProject.projectDir.toPath().toAbsolutePath().normalize()
+    def rel = { File f ->
+        def p = f.toPath().toAbsolutePath().normalize()
+        def r = rootPath.relativize(p).toString().replace('\\', '/')
+        r ?: '.'
+    }
+    def modules = g.rootProject.allprojects.collect { p ->
+        def sourceDirs = []
+        def container = p.extensions.findByName('sourceSets')
+        if (container != null) {
+            container.each { ss ->
+                ss.allSource.srcDirs.each { d -> sourceDirs << rel(d) }
+            }
+        }
+        def deps = []
+        p.configurations.each { cfg ->
+            cfg.dependencies.each { d ->
+                if (d instanceof ProjectDependency) {
+                    deps << [path: d.path, configuration: cfg.name]
+                }
+            }
+        }
+        [
+            path       : p.path,
+            dir        : rel(p.projectDir),
+            source_dirs: sourceDirs,
+            tasks      : p.tasks.names as List,
+            deps       : deps,
+        ]
+    }
+    def included = g.includedBuilds*.name
+    def dump = [
+        unsupported: included
+                ? "composite build (included builds: ${included.join(', ')})".toString()
+                : null,
+        modules    : modules,
+    ]
+    new File(out).text = JsonOutput.toJson(dump)
+}

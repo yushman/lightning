@@ -1,0 +1,6 @@
+plugins {
+    id 'java-library'
+}
+
+// out-of-module source dir: files under ../shared belong to :core
+sourceSets.main.java.srcDir('../shared/src/main/java')
