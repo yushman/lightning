@@ -74,3 +74,10 @@ The server SHALL serve a screen at `/cache` showing: cache storage statistics (e
 - **WHEN** a task path was executed in at least 3 recent builds and never resulted in `from-cache` or `up-to-date`
 - **THEN** the page lists that path with its execution count and total execution time
 
+### Requirement: Favicon
+The server SHALL serve an embedded SVG favicon at `/favicon.svg` and at `/favicon.ico` (SVG body, `image/svg+xml` content type), and every HTML page SHALL reference it with a `<link rel="icon">` tag, so no page load produces a favicon 404.
+
+#### Scenario: Favicon served
+- **WHEN** a browser requests `/favicon.svg` or `/favicon.ico`
+- **THEN** the server responds 200 with `image/svg+xml` content
+
