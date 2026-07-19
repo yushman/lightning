@@ -110,6 +110,17 @@ fn esc(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#14171c"/><path d="M18 4 8 18h6l-2 10L22 13h-6z" fill="#fbbf24"/></svg>"##;
+
+/// Served for both `/favicon.svg` and the browsers' default `/favicon.ico`
+/// probe (SVG body with an SVG content type is accepted there).
+pub async fn favicon() -> impl axum::response::IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "image/svg+xml")],
+        FAVICON_SVG,
+    )
+}
+
 fn page(title: &str, body: &str) -> Html<String> {
     Html(format!(
         r#"<!doctype html>
@@ -117,6 +128,7 @@ fn page(title: &str, body: &str) -> Html<String> {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <title>{title} — lightning</title>
 <style>
 body {{ font: 15px/1.5 -apple-system, "Segoe UI", sans-serif; margin: 2rem auto; max-width: 60rem; padding: 0 1rem; color: #1a1a1a; }}

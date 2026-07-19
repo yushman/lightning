@@ -83,6 +83,8 @@ async fn main() {
     });
     let router = Router::new()
         .route("/", get(web::flaky_page))
+        .route("/favicon.svg", get(web::favicon))
+        .route("/favicon.ico", get(web::favicon))
         .route("/tests/{id}", get(web::test_page))
         .route("/runs/{id}", get(web::run_page))
         .route("/builds", get(web::builds_page))
