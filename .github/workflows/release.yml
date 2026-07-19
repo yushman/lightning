@@ -8,9 +8,16 @@ permissions:
   contents: write
 
 jobs:
-  # the release itself is created on the first tag push (or by hand);
-  # upload-rust-binary-action attaches assets to the release of the tag
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   upload-binaries:
+    needs: create-release
     strategy:
       matrix:
         include:
