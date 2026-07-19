@@ -4,11 +4,19 @@
 
 lightning — self-hosted open-source платформа наблюдаемости и ускорения Gradle CI (в первую очередь для Android-монорепо): слой **над** сборкой, никогда не внутри неё. Сейчас платформа включает четыре возможности: **радар flaky-тестов** (CLI загружает JUnit XML из CI; сервер ведёт историю тестов, считает детерминированный flaky score и показывает, что флапает, с какого момента и на каком коммите), **телеметрию сборок** («build scans lite»: Gradle init-скрипт отправляет на тот же сервер тайминги тасок, результаты кэша, время конфигурации и всей сборки), **remote build cache** с аналитикой (сервер реализует HTTP-протокол кэша Gradle и показывает hit rate, статистику хранилища и некэшируемые таски поверх телеметрии) и **селективное выполнение** (`lightning sync`/`affected`/`run`: один раз снимаем граф модулей, дальше решаем, что затронул diff, на чистом Rust — до старта любой JVM).
 
+## Установка
+
+Возьмите статический бинарник из [Releases](https://github.com/yushman/lightning/releases) (Linux musl x86_64/aarch64, macOS arm64/x86_64 — в каждом архиве оба бинарника: `lightning` и `lightning-server`) или соберите из исходников:
+
+```sh
+curl -sL https://github.com/yushman/lightning/releases/download/v0.1.0/lightning-v0.1.0-x86_64-unknown-linux-musl.tar.gz | tar xz
+# или: cargo build --release
+```
+
 ## Запуск сервера
 
 ```sh
-cargo build --release
-./target/release/lightning-server --addr 0.0.0.0:8080 --db lightning.db --retention-days 90
+./lightning-server --addr 0.0.0.0:8080 --db lightning.db --retention-days 90
 ```
 
 Флаги доступны и как переменные окружения: `LIGHTNING_ADDR`, `LIGHTNING_DB`, `LIGHTNING_RETENTION_DAYS`. UI: `/` (список flaky), `/tests/{id}` (история теста), `/runs/{id}` (сводка прогона), `/builds` (список сборок), `/builds/{id}` (детали сборки), `/trends` (тренды по веткам), `/cache` (хранилище и аналитика кэша); JSON — `/api/flaky` и `/api/builds`.

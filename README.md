@@ -4,11 +4,19 @@
 
 lightning is a self-hosted, open-source observability and acceleration platform for Gradle CI (Android monorepos first): a layer above the build, never inside it. It currently ships four features: a **flaky-test radar** (a CLI uploads JUnit XML results from CI; the server tracks test history, computes deterministic flaky scores, and shows what flakes, since when, and on which commit), **build telemetry** ("build scans lite": a Gradle init script reports per-task timings, cache outcomes, and configuration/total build time to the same server), a **remote Gradle build cache** with analytics (the server speaks Gradle's HTTP build cache protocol and shows hit rates, storage stats, and never-cached tasks on top of the telemetry), and **selective execution** (`lightning sync`/`affected`/`run`: snapshot the module graph once, then decide what a diff touches in pure Rust — before any JVM starts).
 
+## Install
+
+Grab a static binary from [Releases](https://github.com/yushman/lightning/releases) (Linux musl x86_64/aarch64, macOS arm64/x86_64 — each archive contains both `lightning` and `lightning-server`), or build from source:
+
+```sh
+curl -sL https://github.com/yushman/lightning/releases/download/v0.1.0/lightning-v0.1.0-x86_64-unknown-linux-musl.tar.gz | tar xz
+# or: cargo build --release
+```
+
 ## Run the server
 
 ```sh
-cargo build --release
-./target/release/lightning-server --addr 0.0.0.0:8080 --db lightning.db --retention-days 90
+./lightning-server --addr 0.0.0.0:8080 --db lightning.db --retention-days 90
 ```
 
 Flags are also available as env vars: `LIGHTNING_ADDR`, `LIGHTNING_DB`, `LIGHTNING_RETENTION_DAYS`. The UI is at `/` (flaky list), `/tests/{id}` (test history), `/runs/{id}` (run summary), `/builds` (builds list), `/builds/{id}` (build detail), `/trends` (per-branch build trends), `/cache` (cache storage and analytics); JSON at `/api/flaky` and `/api/builds`.
