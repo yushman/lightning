@@ -12,7 +12,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: gh release view "$TAG" --repo "$GITHUB_REPOSITORY" || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "$(git tag -l --format='%(contents:body)' "$TAG")"
+      - run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "$(git tag -l --format='%(contents:body)' "$TAG")"
+          # a release whose tag was ever deleted silently becomes a draft
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
