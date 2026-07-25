@@ -1,8 +1,17 @@
 # lightning
 
-[In English](README.md)
+[![ci](https://github.com/yushman/lightning/actions/workflows/ci.yml/badge.svg)](https://github.com/yushman/lightning/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/yushman/lightning)](https://github.com/yushman/lightning/releases/latest)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+
+[In English](README.md) · [Сайт](https://yushman.github.io/lightning/) · [Почему не ещё одна система сборки](https://yushman.github.io/lightning/why-not-another-build-system.html)
 
 lightning — self-hosted open-source платформа наблюдаемости и ускорения Gradle CI (в первую очередь для Android-монорепо): слой **над** сборкой, никогда не внутри неё. Сейчас платформа включает четыре возможности: **радар flaky-тестов** (CLI загружает JUnit XML из CI; сервер ведёт историю тестов, считает детерминированный flaky score и показывает, что флапает, с какого момента и на каком коммите), **телеметрию сборок** («build scans lite»: Gradle init-скрипт отправляет на тот же сервер тайминги тасок, результаты кэша, время конфигурации и всей сборки), **remote build cache** с аналитикой (сервер реализует HTTP-протокол кэша Gradle и показывает hit rate, статистику хранилища и некэшируемые таски поверх телеметрии) и **селективное выполнение** (`lightning sync`/`affected`/`run`: один раз снимаем граф модулей, дальше решаем, что затронул diff, на чистом Rust — до старта любой JVM).
+
+<p align="center">
+  <img src="site/flaky.png" alt="Список flaky-тестов с детерминированными score и полосами прогонов" width="820">
+  <br><em>Радар flaky-тестов: что флапает, насколько сильно и с какого момента.</em>
+</p>
 
 ## Установка
 
@@ -133,6 +142,17 @@ jobs:
       - uses: actions/checkout@v4
       - run: ./gradlew ${{ matrix.module }}:test
 ```
+
+## Модель безопасности
+
+Сервер рассчитан на доверенную сеть — VPN, приватную подсеть или собственный reverse proxy с авторизацией:
+
+- **Эндпоинты приёма данных (`/api/runs`, `/api/builds`) без авторизации.** Любой, кто достаёт до сервера, может добавить результаты тестов и документы сборок; токен для ingest — в планах, а не в релизе.
+- **Запись в кэш можно защитить** общим токеном (`--cache-token` / `LIGHTNING_CACHE_TOKEN`); чтение всегда открыто.
+- **Записи кэша — это непрозрачные артефакты сборки.** Кто может писать в кэш, тот может отравить ваши сборки: считайте право записи равным доступу к CI.
+- **Ничего никуда не отправляется.** Нет хостинга и телеметрии — все данные остаются в вашем файле SQLite и каталоге кэша.
+
+Селективному выполнению (`sync` / `affected` / `run`) сервер не нужен вообще: оно читает только рабочее дерево.
 
 ## Лицензия
 

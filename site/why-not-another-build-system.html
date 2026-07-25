@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Every JVM build system is written in a JVM language. I wanted to know why.</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2314171c'/%3E%3Cpath d='M18 4 8 18h6l-2 10L22 13h-6z' fill='%23fbbf24'/%3E%3C/svg%3E">
+<meta name="description" content="Why every mainstream build system for Java, Kotlin and Android runs on the JVM, why Gradle's slowness isn't Groovy's fault, and why the real moat is Android — not the JVM.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="wrap prose topnav"><a href="./">⚡ lightning</a></nav>
+
+<article class="wrap prose">
+
+<header style="padding: 40px 0 8px">
+  <h1>Every JVM build system is written in a JVM language. I wanted to know why.</h1>
+  <p class="meta">July 2026 · on Gradle, Buck2, and the build system I decided not to write</p>
+</header>
+
+<p>Every mainstream build system for Java, Kotlin and Android runs on the JVM and is configured in a JVM language — Groovy or Kotlin. If you have spent an afternoon waiting on Gradle, the question writes itself: why not Go or Rust? Native startup, no daemon eating four gigabytes, declarative configuration like <code>Cargo.toml</code> instead of a Turing-complete script that can do literally anything.</p>
+
+<p>I spent a while trying to answer that honestly, planning to build the thing. I didn't build it. Here is what changed my mind, because the reasoning turned out to be more interesting than the plan.</p>
+
+<h2>The premise is already falsified</h2>
+
+<p>The first surprise: it has been done. <strong>Buck2</strong> is written in Rust, configured in Starlark, and builds Java, Kotlin and Android in production at Meta — millions of builds a day, including incremental Kotlin compilation through JetBrains' Build Tools API. <strong>Bazel</strong> keeps a Java core but moved configuration out of the JVM entirely, also to Starlark.</p>
+
+<p>So the interesting question isn't "is it possible". It is: given that it's possible and demonstrably fast, why is everyone else still on the JVM?</p>
+
+<h2>Three structural reasons, none of them inertia</h2>
+
+<p><strong>The compilers are JVM programs.</strong> <code>javac</code>, <code>kotlinc</code>, KSP, the Compose compiler — all of them run on the JVM. Whatever language your build system is written in, it ends up starting JVM processes. A non-JVM build system is not "a build system without the JVM"; it is an <em>orchestrator</em> around JVM compile workers. That is a smaller, more honest claim than the one I started with.</p>
+
+<p><strong>A warm compiler is the performance model.</strong> Incremental build speed comes from a long-lived JVM with a warmed-up JIT and populated caches. Gradle's memory-hungry daemon isn't an accident of implementation language you can optimize away — it <em>is</em> the mechanism. Replace the orchestrator with a native binary and you still need that warm JVM behind it; you have moved the memory, not removed it.</p>
+
+<p><strong>Plugins live inside the process.</strong> Build plugins call compiler APIs directly, run annotation processors, instrument bytecode. From a JVM language that is a method call. From Go or Rust it is an IPC protocol you now own, version, and debug — for every integration point in an ecosystem that has thousands.</p>
+
+<h2>The insight that actually mattered</h2>
+
+<blockquote>Gradle is not slow because of Groovy. It is slow because of a model that cannot be cached.</blockquote>
+
+<p>Gradle's configuration phase executes arbitrary, Turing-complete code across every module of your project, and it can't be reliably cached precisely because that code can do anything — read the clock, hit the network, mutate another module's tasks. Buck2 is fast first and foremost because its configuration is declarative Starlark with no side effects, which makes the entire build graph hashable and cacheable.</p>
+
+<p>Rust is a nice bonus there. Declarativeness is the foundation. If you took Buck2's model and implemented it on the JVM, you would still have most of the win; if you took Gradle's model and rewrote it in Rust, you would still have the problem. That single observation demolished the original plan, because the plan's whole premise was that the language was the lever.</p>
+
+<h2>The 2026 landscape, and one telling data point</h2>
+
+<p>Meanwhile, the pain is being attacked from three directions at once:</p>
+
+<table>
+<thead><tr><th>Project</th><th>Core language</th><th>Configuration</th><th>Status (mid-2026)</th></tr></thead>
+<tbody>
+<tr><td>Buck2 (Meta)</td><td>Rust</td><td>Starlark</td><td>Production at Meta, incl. Android and incremental Kotlin</td></tr>
+<tr><td>Bazel (Google)</td><td>Java</td><td>Starlark</td><td>Production; Android support historically shaky</td></tr>
+<tr><td>Kotlin Toolchain (ex-Amper, JetBrains)</td><td>Kotlin (JVM)</td><td>Declarative, YAML-like</td><td>Alpha since June 2026; the Amper repo was archived in May 2026</td></tr>
+<tr><td>Declarative Gradle (DCL)</td><td>JVM</td><td>Declarative <code>.gradle.dcl</code></td><td>EAP3; AGP exposes <code>androidApp</code>/<code>androidLibrary</code> software types</td></tr>
+<tr><td>Mill</td><td>Scala</td><td>Scala</td><td>Niche, notably faster than Gradle</td></tr>
+</tbody>
+</table>
+
+<p>Now the data point I keep coming back to. JetBrains set out to solve exactly the three pains I started from — speed, implicit magic, and imperative build scripts — and built their new tool <strong>in Kotlin again</strong>. People with a compiler team, an IDE team, and every incentive to escape the JVM looked at the same tradeoff and stayed. The structural reasons above outweigh a native core, and they know it better than I do.</p>
+
+<h2>The real moat is Android, not the JVM</h2>
+
+<p>Suppose you ignore all of that and write the orchestrator anyway. For plain Kotlin/JVM it's a real, finishable project — a few months of interesting work.</p>
+
+<p>Then someone asks for Android, and the job changes shape. Now you must reproduce the surface of the Android Gradle Plugin: AAPT2, resource and manifest merging, R8 and D8, multidex, signing, baseline profiles, the Compose compiler plugin, KSP wiring, build variants and flavors — against a target that Google moves with every AGP release. This is why no "Gradle killer" exists for Android even though almost nobody enjoys Gradle. Meta can afford it because Meta has a build-infrastructure organization. A solo project cannot, and pretending otherwise is how side projects die at 80% done.</p>
+
+<h2>So I built the layer above instead</h2>
+
+<p>Here is where the reasoning led. The valuable, unoccupied position isn't <em>replacing</em> the build. It is everything <em>around</em> the build that nobody has open-sourced for Gradle: knowing which tests are flaky and since when, knowing why a build got slower, caching artifacts across machines, and deciding what a diff actually affects before a single JVM starts.</p>
+
+<p>All of that can be done from outside — a CLI, a couple of init scripts, an HTTP cache — with no build ownership, and therefore no AGP treadmill. It is also, as it happens, where a commercial product already proves the demand: Develocity sells exactly this, at enterprise prices, closed. BuildBuddy filled that niche for Bazel. For Gradle it was empty.</p>
+
+<p>That's <a href="./">lightning</a>: a self-hosted, Apache-2.0 platform — one Rust binary with SQLite — doing flaky-test radar, build telemetry, remote build cache with analytics, and diff-aware test selection. On <a href="https://github.com/android/nowinandroid">nowinandroid</a>, a change in one core module selects 24 of 45 modules; a docs-only pull request is decided in milliseconds, before CI has installed a JDK.</p>
+
+<p>The uncomfortable part of this story is that the interesting question ("could I write a build system in Rust?") had a boring answer, and the boring question ("what's missing around the build?") had the interesting one. I only got there by taking the first question seriously enough to be talked out of it.</p>
+
+<div class="endnote">
+  <p style="margin-top:0"><strong>lightning</strong> — see why your Gradle CI is slow and flaky, then fix it. Self-hosted, open source, no telemetry leaving your network.</p>
+  <p><a href="./">Overview</a> · <a href="https://github.com/yushman/lightning">GitHub</a> · <a href="https://github.com/yushman/lightning/releases/latest">Download</a></p>
+</div>
+
+<h2>Sources</h2>
+<ul class="sources">
+<li><a href="https://buck2.build/">Buck2</a> and <a href="https://engineering.fb.com/2025/08/26/open-source/enabling-kotlin-incremental-compilation-on-buck2/">Enabling Kotlin incremental compilation on Buck2</a> (Meta Engineering)</li>
+<li><a href="https://blog.jetbrains.com/amper/2026/06/kotlin-toolchain-0-11/">Kotlin Toolchain 0.11: The Next Step for Amper</a> (JetBrains) and the <a href="https://github.com/JetBrains/amper">archived Amper repository</a></li>
+<li><a href="https://gradle.github.io/declarative-gradle/">Declarative Gradle</a> and the <a href="https://blog.gradle.org/declarative-gradle-april-2025-update">EAP3 update</a></li>
+</ul>
+
+</article>
+
+<footer>
+  <div class="wrap">
+    <a href="https://github.com/yushman/lightning">github.com/yushman/lightning</a> · Apache-2.0 · built for Gradle &amp; Android monorepos
+  </div>
+</footer>
+
+</body>
+</html>

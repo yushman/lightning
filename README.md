@@ -1,8 +1,17 @@
 # lightning
 
-[По-русски](README_RU.md)
+[![ci](https://github.com/yushman/lightning/actions/workflows/ci.yml/badge.svg)](https://github.com/yushman/lightning/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/yushman/lightning)](https://github.com/yushman/lightning/releases/latest)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+
+[По-русски](README_RU.md) · [Website](https://yushman.github.io/lightning/) · [Why this and not another build system](https://yushman.github.io/lightning/why-not-another-build-system.html)
 
 lightning is a self-hosted, open-source observability and acceleration platform for Gradle CI (Android monorepos first): a layer above the build, never inside it. It currently ships four features: a **flaky-test radar** (a CLI uploads JUnit XML results from CI; the server tracks test history, computes deterministic flaky scores, and shows what flakes, since when, and on which commit), **build telemetry** ("build scans lite": a Gradle init script reports per-task timings, cache outcomes, and configuration/total build time to the same server), a **remote Gradle build cache** with analytics (the server speaks Gradle's HTTP build cache protocol and shows hit rates, storage stats, and never-cached tasks on top of the telemetry), and **selective execution** (`lightning sync`/`affected`/`run`: snapshot the module graph once, then decide what a diff touches in pure Rust — before any JVM starts).
+
+<p align="center">
+  <img src="site/flaky.png" alt="Flaky tests list with deterministic scores and pass/fail trend strips" width="820">
+  <br><em>Flaky-test radar: what flakes, how badly, and since when.</em>
+</p>
 
 ## Install
 
@@ -133,6 +142,17 @@ jobs:
       - uses: actions/checkout@v4
       - run: ./gradlew ${{ matrix.module }}:test
 ```
+
+## Security posture
+
+Be deliberate about where you run the server. It is designed for a trusted network (a VPN, a private subnet, or behind your own authenticating reverse proxy):
+
+- **Ingest endpoints (`/api/runs`, `/api/builds`) are unauthenticated.** Anyone who can reach the server can add test results and build documents — a token for ingest is planned, not shipped.
+- **Cache writes can be protected** with a shared token (`--cache-token` / `LIGHTNING_CACHE_TOKEN`); reads are always open.
+- **Cache entries are opaque build outputs.** A writer you don't trust is a writer who can poison your builds — treat write access as equivalent to CI access.
+- **Nothing phones home.** There is no hosted service and no telemetry; all data stays in your SQLite file and cache directory.
+
+Selective execution (`lightning sync` / `affected` / `run`) needs no server at all and reads only your working tree.
 
 ## License
 
