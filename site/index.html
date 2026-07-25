@@ -69,7 +69,8 @@ a { color: var(--accent-fg); }
     <span class="badge">No build-plugin lock-in</span>
   </div>
   <div class="cta">
-    <a class="primary" href="https://github.com/yushman/lightning">GitHub →</a>
+    <a class="primary" href="https://github.com/yushman/lightning/releases/latest">Download v0.1.0 →</a>
+    <a class="ghost" href="https://github.com/yushman/lightning">GitHub</a>
     <a class="ghost" href="#start">15-minute setup</a>
   </div>
 </header>
@@ -121,7 +122,7 @@ $ lightning affected --format github-matrix</pre>
 <section class="wrap" id="start">
   <h2>Start in 15 minutes</h2>
   <div class="steps">
-    <div class="step"><div><b>Run the server.</b> <code>lightning-server --addr 0.0.0.0:8080 --db lightning.db</code> — one binary, SQLite next to it, done.</div></div>
+    <div class="step"><div><b>Run the server.</b> Grab a static binary from <a href="https://github.com/yushman/lightning/releases/latest">Releases</a> (Linux musl, macOS — arm64 and x86_64), then <code>lightning-server --addr 0.0.0.0:8080 --db lightning.db</code>. One binary, SQLite next to it, done.</div></div>
     <div class="step"><div><b>Add one CI step.</b> <code>lightning upload --server https://…</code> after your tests. A week later you have a flaky radar with history and guilty commits.</div></div>
     <div class="step"><div><b>Go deeper when the data earns it.</b> Telemetry init script → remote cache → diff-aware selection. Each step is independent; each is removable in a minute.</div></div>
   </div>
