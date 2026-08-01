@@ -1,12 +1,6 @@
 :root {
-  --bg: #ffffff; --fg: #1a1d21; --muted: #5b6470; --line: #e5e8ec;
-  --accent: #f59e0b; --accent-fg: #7c4a03; --card: #f7f8fa; --code-bg: #14171c; --code-fg: #d8dee7;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0f1216; --fg: #e6e9ee; --muted: #98a2b0; --line: #242a32;
-    --accent: #fbbf24; --accent-fg: #fde68a; --card: #161b22; --code-bg: #0a0d11; --code-fg: #cdd5e0;
-  }
+  --bg: #0f1216; --fg: #e6e9ee; --muted: #98a2b0; --line: #242a32;
+  --accent: #fbbf24; --accent-fg: #fde68a; --card: #161b22; --code-bg: #0a0d11; --code-fg: #cdd5e0;
 }
 * { box-sizing: border-box; margin: 0; }
 body { background: var(--bg); color: var(--fg); font: 17px/1.65 -apple-system, "Segoe UI", Roboto, sans-serif; }
@@ -42,8 +36,7 @@ pre .c { color: #7d8aa0; } pre .g { color: #7ee787; } pre .y { color: #f0c674; }
 .step::before { counter-increment: s; content: counter(s); flex: 0 0 30px; height: 30px; border-radius: 50%; background: var(--accent); color: #1a1204; font-weight: 700; display: grid; place-items: center; font-size: 15px; }
 footer { border-top: 1px solid var(--line); padding: 36px 0 60px; color: var(--muted); font-size: 15px; text-align: center; }
 footer a { color: inherit; }
-a { color: var(--accent-fg); }
-@media (prefers-color-scheme: dark) { a { color: var(--accent); } .cta a.primary { color: #14100a; } }
+a { color: var(--accent); }
 
 /* essay pages */
 .prose { max-width: 44em; }
