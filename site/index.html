@@ -30,35 +30,18 @@
 
 <section class="wrap" id="numbers">
   <h2>Measured on real monorepos</h2>
-  <p class="lead">Every number below comes from running lightning against nowinandroid (Google's 45-module Android showcase) and detekt — not from a benchmark lab.</p>
+  <p class="lead">Every number below is reproduced by a committed benchmark harness against a pinned commit of nowinandroid (Google's 45-module Android showcase). Run it yourself: <code>benchmarks/run.sh benchmarks/nowinandroid.json</code>, and read the <a href="https://github.com/yushman/lightning/blob/main/benchmarks/results/nowinandroid-2026-07-25.md">full report</a> — including the case where lightning helps least.</p>
   <div class="numbers">
     <div class="num"><b>24 / 45</b><span>modules actually affected by a typical core-module change — the rest never run</span></div>
-    <div class="num"><b>exit in ms</b><span>docs-only PRs are decided before CI even installs a JDK</span></div>
-    <div class="num"><b>29s → 3s</b><span>rebuild after <code>clean</code> with the remote build cache</span></div>
+    <div class="num"><b>62 ms</b><span>to decide a docs-only PR runs nothing, against 62 s of unit tests it would otherwise cost</span></div>
+    <div class="num"><b>95s → 9s</b><span>same unit-test run, second time, served by the remote build cache</span></div>
     <div class="num"><b>1 binary</b><span>server = single Rust executable with SQLite; <code>scp</code> it anywhere</span></div>
   </div>
 </section>
 
 <section class="wrap">
-  <h2>Flaky-test radar</h2>
-  <p class="lead">One line in CI uploads your JUnit XML. The server keeps per-test history across runs and computes a <strong>deterministic</strong> flaky score — verdict flips on the same commit, flip-rate over a rolling window. No ML, no black box: you can recompute every score by hand. Genuine regressions don't pollute the list.</p>
-  <div class="shot"><img src="flaky.png" alt="Flaky tests list with scores and pass/fail trend strips"></div>
-</section>
-
-<section class="wrap">
-  <h2>Build telemetry — “build scans lite”</h2>
-  <p class="lead">A Gradle init script (fail-safe: it can never break your build) reports task timings, cache outcomes and configuration time. See what's slow, what stopped caching, and how much work every build avoided.</p>
-  <div class="shot"><img src="builds.png" alt="Builds list with duration and avoided-work percentage"></div>
-</section>
-
-<section class="wrap">
-  <h2>Remote build cache that explains itself</h2>
-  <p class="lead">Gradle's HTTP build cache protocol in the same binary — with LRU eviction, TTL, optional write token, and analytics on top: hit rates, top artifacts, and the tasks that never hit cache.</p>
-  <div class="shot"><img src="cache.png" alt="Cache storage stats and analytics"></div>
-</section>
-
-<section class="wrap">
-  <h2>Run only what a diff affects</h2>
+  <span class="badge">Why lightning exists</span>
+  <h2 style="margin-top:14px">Run only what a diff affects</h2>
   <p class="lead"><code>lightning sync</code> snapshots your module graph once (typed main/test edges, source sets, per-module tasks). After that, deciding what a PR touches is pure Rust — <strong>no JVM starts</strong>. The correctness rule is absolute: an extra run is acceptable, a missed test never is.</p>
   <pre><span class="c"># nowinandroid, one file changed in :core:model</span>
 $ lightning affected --base origin/main
@@ -70,6 +53,25 @@ $ lightning affected --quiet && echo run || echo skip
 
 <span class="c"># fan heavy runners out over affected modules only</span>
 $ lightning affected --format github-matrix</pre>
+</section>
+
+<section class="wrap">
+  <span class="badge">Also included</span>
+  <h2 style="margin-top:14px">Flaky-test radar</h2>
+  <p class="lead">One line in CI uploads your JUnit XML. The server keeps per-test history across runs and computes a <strong>deterministic</strong> flaky score — verdict flips on the same commit, flip-rate over a rolling window. No ML, no black box: you can recompute every score by hand. Genuine regressions don't pollute the list.</p>
+  <div class="shot"><img src="flaky.png" alt="Flaky tests list with scores and pass/fail trend strips"></div>
+</section>
+
+<section class="wrap">
+  <h2>Build telemetry — “build scans lite”</h2>
+  <p class="lead">A Gradle init script (fail-safe: it can never break your build) reports task timings, cache outcomes and configuration time. See what's slow, what stopped caching, and how much work every build avoided.</p>
+  <div class="shot"><img src="builds.png" alt="Builds list with duration and avoided-work percentage"></div>
+</section>
+
+<section class="wrap">
+  <h2>...and a remote cache, since you'll want one</h2>
+  <p class="lead">Gradle's HTTP build cache protocol in the same binary — with LRU eviction, TTL, and optional write token. The free Gradle Build Cache Node does the same protocol; what's on top here is analytics — hit rates, top artifacts, and the tasks that never hit cache — using the telemetry lightning already collects.</p>
+  <div class="shot"><img src="cache.png" alt="Cache storage stats and analytics"></div>
 </section>
 
 <section class="wrap" id="start">
