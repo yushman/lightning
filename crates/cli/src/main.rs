@@ -1,6 +1,7 @@
 mod affected;
 mod config;
 mod gitdiff;
+mod github;
 mod junit;
 mod lock;
 mod meta;
@@ -57,6 +58,11 @@ struct UploadArgs {
     /// Idempotency key for this run (default: derived from CI env or payload)
     #[arg(long)]
     run_key: Option<String>,
+    /// Upsert a PR comment listing tests from this run that are currently
+    /// flaky (GitHub Actions pull_request events only, needs GITHUB_TOKEN
+    /// with pull-requests: write; silently does nothing otherwise)
+    #[arg(long)]
+    pr_comment: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -156,12 +162,82 @@ fn upload(args: UploadArgs) -> Result<(), String> {
     } else {
         println!("uploaded {} results as run {run_id}", results.len());
     }
+    if args.pr_comment {
+        post_flaky_pr_comment(&args.server, &results);
+    }
     Ok(())
+}
+
+const FLAKY_PR_COMMENT_MARKER: &str = "<!-- lightning:flaky -->";
+
+fn post_flaky_pr_comment(server: &str, results: &[TestResult]) {
+    let Some(ctx) = github::PrContext::resolve() else {
+        return;
+    };
+    match flaky_comment_body(server, results) {
+        Ok(body) => github::post_pr_comment(Some(&ctx), FLAKY_PR_COMMENT_MARKER, &body),
+        Err(e) => eprintln!("warning: --pr-comment failed: {e}"),
+    }
+}
+
+/// Fetches `<server>/api/flaky` and builds the comment body for tests from
+/// this run that are currently flaky (`score > 0`). Identity match against
+/// the run's results is a trimmed exact match on class name and test name —
+/// a weak signal, same trade-off as the server's own `never_cached_tasks`.
+fn flaky_comment_body(server: &str, results: &[TestResult]) -> Result<String, String> {
+    let url = format!("{}/api/flaky", server.trim_end_matches('/'));
+    let mut response = github::agent()
+        .get(&url)
+        .call()
+        .map_err(|e| format!("GET {url} failed: {e}"))?;
+    let flaky: Vec<serde_json::Value> = response
+        .body_mut()
+        .read_json()
+        .map_err(|e| format!("invalid response from {url}: {e}"))?;
+    let present_in_run = |class_name: &str, name: &str| {
+        results
+            .iter()
+            .any(|r| r.class_name.trim() == class_name.trim() && r.name.trim() == name.trim())
+    };
+    let matches: Vec<&serde_json::Value> = flaky
+        .iter()
+        .filter(|f| {
+            f["score"].as_i64().unwrap_or(0) > 0
+                && present_in_run(
+                    f["class_name"].as_str().unwrap_or(""),
+                    f["name"].as_str().unwrap_or(""),
+                )
+        })
+        .collect();
+    if matches.is_empty() {
+        return Ok(
+            "⚡ **lightning flaky check**: no flaky tests observed in this run.".to_string(),
+        );
+    }
+    let server = server.trim_end_matches('/');
+    let rows: String = matches
+        .iter()
+        .map(|f| {
+            let test_id = f["test_id"].as_i64().unwrap_or(0);
+            let class_name = github::escape_cell(f["class_name"].as_str().unwrap_or(""));
+            let name = github::escape_cell(f["name"].as_str().unwrap_or(""));
+            let score = f["score"].as_i64().unwrap_or(0);
+            format!("| `{class_name}` `{name}` | {score} | [details]({server}/tests/{test_id}) |\n")
+        })
+        .collect();
+    Ok(format!(
+        "⚡ **lightning flaky check**: {} flaky test(s) in this run\n\n\
+| Test | Score | |\n|---|---|---|\n{rows}",
+        matches.len()
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use junit::Status;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
 
     #[test]
     fn init_script_writes_embedded_asset() {
@@ -176,5 +252,63 @@ mod tests {
         assert_eq!(written, INIT_SCRIPT);
         assert!(written.contains("LightningTelemetryService"));
         assert!(written.contains("/api/builds"));
+    }
+
+    fn result(class_name: &str, name: &str) -> TestResult {
+        TestResult {
+            class_name: class_name.into(),
+            name: name.into(),
+            status: Status::Pass,
+            time_ms: 1,
+            message: None,
+        }
+    }
+
+    /// One-shot mock server for a single `GET /api/flaky` response.
+    fn serve_flaky(body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut data = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).unwrap();
+                assert!(n != 0, "connection closed before a full request arrived");
+                data.extend_from_slice(&buf[..n]);
+                if data.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn flaky_comment_body_lists_matching_tests() {
+        let server = serve_flaky(
+            r#"[{"test_id":1,"class_name":"com.Foo","name":"bar","score":40},
+                {"test_id":2,"class_name":"com.Other","name":"baz","score":30}]"#,
+        );
+        let results = vec![result("com.Foo", "bar")];
+        let body = flaky_comment_body(&server, &results).unwrap();
+        assert!(body.contains("1 flaky test(s)"));
+        assert!(body.contains("com.Foo"));
+        assert!(body.contains("bar"));
+        assert!(!body.contains("com.Other"));
+    }
+
+    #[test]
+    fn flaky_comment_body_states_no_flaky_tests_explicitly() {
+        let server =
+            serve_flaky(r#"[{"test_id":1,"class_name":"com.Foo","name":"bar","score":40}]"#);
+        let results = vec![result("com.Unrelated", "test")];
+        let body = flaky_comment_body(&server, &results).unwrap();
+        assert!(body.contains("no flaky tests observed"));
     }
 }

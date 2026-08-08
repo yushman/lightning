@@ -28,7 +28,7 @@ curl -sL https://github.com/yushman/lightning/releases/download/v0.1.0/lightning
 ./lightning-server --addr 0.0.0.0:8080 --db lightning.db --retention-days 90
 ```
 
-Флаги доступны и как переменные окружения: `LIGHTNING_ADDR`, `LIGHTNING_DB`, `LIGHTNING_RETENTION_DAYS`. UI: `/` (список flaky), `/tests/{id}` (история теста), `/runs/{id}` (сводка прогона), `/builds` (список сборок), `/builds/{id}` (детали сборки), `/trends` (тренды по веткам), `/cache` (хранилище и аналитика кэша); JSON — `/api/flaky` и `/api/builds`.
+Флаги доступны и как переменные окружения: `LIGHTNING_ADDR`, `LIGHTNING_DB`, `LIGHTNING_RETENTION_DAYS`. UI: `/` (список flaky), `/tests/{id}` (история теста), `/runs/{id}` (сводка прогона), `/builds` (список сборок), `/builds/{id}` (детали сборки), `/trends` (тренды по веткам и деградировавшие таски), `/cache` (хранилище и аналитика кэша); JSON — `/api/flaky`, `/api/builds` и `/api/trends/regressions`.
 
 ## Загрузка результатов тестов из CI
 
@@ -41,6 +41,21 @@ curl -sL https://github.com/yushman/lightning/releases/download/v0.1.0/lightning
 ```
 
 `lightning upload` парсит отчёты по маске `**/build/test-results/**/*.xml` (переопределяется `--glob`), берёт SHA/ветку и идентичность прогона из окружения GitHub Actions или локального git-репозитория и загружает идемпотентно — повторный запуск шага никогда не создаёт дубликат прогона.
+
+## Комментарии в PR
+
+Добавьте `--pr-comment` к `lightning affected` или `lightning upload`, чтобы апсертить сводку прямо в PR — затронутые модули и тесты из этого прогона, которые сейчас флакуют. Нужен `pull-requests: write`, чтобы `GITHUB_TOKEN` мог постить комментарии:
+
+```yaml
+permissions:
+  pull-requests: write
+
+steps:
+  - run: lightning affected --auto-sync --pr-comment
+  - run: lightning upload --server https://lightning.example.com --pr-comment
+```
+
+Оба флага независимы и fail-safe: вне события `pull_request` или без права выше они молча ничего не делают — сборку никогда не ломают. Каждый апсертит свой комментарий (`⚡ lightning affected`, `⚡ lightning flaky check`), поэтому повторные запуски обновляют его на месте, а не плодят новые.
 
 ## Телеметрия сборок в CI
 

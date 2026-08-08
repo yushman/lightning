@@ -573,12 +573,89 @@ indistinguishable from uncacheable tasks — a starting point for investigation,
     Ok(page("build cache", &body))
 }
 
-fn median(mut values: Vec<i64>) -> Option<i64> {
-    if values.is_empty() {
-        return None;
-    }
-    values.sort_unstable();
-    Some(values[values.len() / 2])
+const REGRESSION_RECENT_WINDOW: usize = 10;
+const REGRESSION_BASELINE_WINDOW: usize = 30;
+const REGRESSION_MIN_EXECUTIONS: usize = 3;
+const REGRESSION_THRESHOLD_PCT: f64 = 0.25;
+const REGRESSION_MIN_DELTA_MS: i64 = 500;
+
+#[derive(serde::Deserialize)]
+pub struct BranchQuery {
+    branch: Option<String>,
+}
+
+pub async fn regressions_api(
+    State(app): State<Arc<App>>,
+    axum::extract::Query(q): axum::extract::Query<BranchQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let branch = q.branch.as_deref().unwrap_or("main");
+    let conn = app.db.lock().unwrap();
+    let regressions = db::task_regressions(
+        &conn,
+        branch,
+        REGRESSION_RECENT_WINDOW,
+        REGRESSION_BASELINE_WINDOW,
+        REGRESSION_MIN_EXECUTIONS,
+        REGRESSION_THRESHOLD_PCT,
+        REGRESSION_MIN_DELTA_MS,
+    )
+    .map_err(internal)?;
+    let items: Vec<serde_json::Value> = regressions
+        .iter()
+        .map(|r| {
+            json!({
+                "path": r.path,
+                "baseline_median_ms": r.baseline_median_ms,
+                "recent_median_ms": r.recent_median_ms,
+                "pct_delta": r.pct_delta,
+            })
+        })
+        .collect();
+    Ok(Json(json!(items)))
+}
+
+fn regressed_tasks_section(
+    conn: &rusqlite::Connection,
+    branch: &str,
+) -> Result<String, StatusCode> {
+    let regressions = db::task_regressions(
+        conn,
+        branch,
+        REGRESSION_RECENT_WINDOW,
+        REGRESSION_BASELINE_WINDOW,
+        REGRESSION_MIN_EXECUTIONS,
+        REGRESSION_THRESHOLD_PCT,
+        REGRESSION_MIN_DELTA_MS,
+    )
+    .map_err(internal)?;
+    let body = if regressions.is_empty() {
+        format!(
+            "<p class=\"muted\">No tasks have regressed on <b>{}</b>.</p>",
+            esc(branch)
+        )
+    } else {
+        let rows: String = regressions
+            .iter()
+            .map(|r| {
+                format!(
+                    r#"<tr><td><code>{path}</code></td><td class="num">{baseline}</td>
+<td class="num">{recent}</td><td class="num">+{pct}%</td></tr>"#,
+                    path = esc(&r.path),
+                    baseline = fmt_ms(r.baseline_median_ms),
+                    recent = fmt_ms(r.recent_median_ms),
+                    pct = r.pct_delta,
+                )
+            })
+            .collect();
+        format!(
+            "<table><tr><th>Task path</th><th class=\"num\">Baseline median</th>\
+<th class=\"num\">Recent median</th><th class=\"num\">Change</th></tr>{rows}</table>"
+        )
+    };
+    Ok(format!(
+        "<h3>Regressed tasks — {branch}</h3>{body}",
+        branch = esc(branch)
+    ))
 }
 
 pub async fn trends_page(State(app): State<Arc<App>>) -> Result<Html<String>, StatusCode> {
@@ -619,8 +696,8 @@ pub async fn trends_page(State(app): State<Arc<App>>) -> Result<Html<String>, St
             Trend {
                 branch: name.clone(),
                 count: list.len(),
-                median_ms: median(durations),
-                median_avoided_pct: median(avoided),
+                median_ms: db::median(durations),
+                median_avoided_pct: db::median(avoided),
             }
         })
         .collect();
@@ -650,10 +727,18 @@ pub async fn trends_page(State(app): State<Arc<App>>) -> Result<Html<String>, St
             )
         })
         .collect();
+    let mut regressed_sections = String::new();
+    for (name, _) in &branches {
+        regressed_sections.push_str(&regressed_tasks_section(&conn, name)?);
+    }
+    let threshold_pct_whole = (REGRESSION_THRESHOLD_PCT * 100.0) as i64;
     let body = format!(
         "<p class=\"muted\">Per branch over its last {TREND_WINDOW} builds; median duration counts successful builds only.</p>\
 <table><tr><th>Branch</th><th class=\"num\">Builds</th><th class=\"num\">Median duration</th>\
-<th></th><th class=\"num\">Median avoided</th></tr>{rows}</table>"
+<th></th><th class=\"num\">Median avoided</th></tr>{rows}</table>\
+<p class=\"muted\">Regressed: recent {REGRESSION_RECENT_WINDOW}-build median at least {threshold_pct_whole}% \
+and {REGRESSION_MIN_DELTA_MS}ms higher than the {REGRESSION_BASELINE_WINDOW}-build baseline before it.</p>\
+{regressed_sections}"
     );
     Ok(page("build trends", &body))
 }

@@ -28,7 +28,7 @@ curl -sL https://github.com/yushman/lightning/releases/download/v0.1.0/lightning
 ./lightning-server --addr 0.0.0.0:8080 --db lightning.db --retention-days 90
 ```
 
-Flags are also available as env vars: `LIGHTNING_ADDR`, `LIGHTNING_DB`, `LIGHTNING_RETENTION_DAYS`. The UI is at `/` (flaky list), `/tests/{id}` (test history), `/runs/{id}` (run summary), `/builds` (builds list), `/builds/{id}` (build detail), `/trends` (per-branch build trends), `/cache` (cache storage and analytics); JSON at `/api/flaky` and `/api/builds`.
+Flags are also available as env vars: `LIGHTNING_ADDR`, `LIGHTNING_DB`, `LIGHTNING_RETENTION_DAYS`. The UI is at `/` (flaky list), `/tests/{id}` (test history), `/runs/{id}` (run summary), `/builds` (builds list), `/builds/{id}` (build detail), `/trends` (per-branch build trends and regressed tasks), `/cache` (cache storage and analytics); JSON at `/api/flaky`, `/api/builds`, and `/api/trends/regressions`.
 
 ## Add upload to CI
 
@@ -41,6 +41,21 @@ Add one step after your tests (no build integration needed):
 ```
 
 `lightning upload` parses reports matching `**/build/test-results/**/*.xml` (override with `--glob`), takes SHA/branch and run identity from GitHub Actions env or the local git repo, and uploads idempotently — re-running the step never duplicates a run.
+
+## Comment on pull requests
+
+Add `--pr-comment` to `lightning affected` or `lightning upload` to upsert a summary comment directly on the PR — affected-module scope, and tests from this run that are currently flaky. Needs `pull-requests: write` so `GITHUB_TOKEN` can post comments:
+
+```yaml
+permissions:
+  pull-requests: write
+
+steps:
+  - run: lightning affected --auto-sync --pr-comment
+  - run: lightning upload --server https://lightning.example.com --pr-comment
+```
+
+Both flags are independent and fail-safe: outside a `pull_request` event, or without the permission above, they silently do nothing — never fail the build. Each upserts its own comment (`⚡ lightning affected`, `⚡ lightning flaky check`), so re-runs update in place instead of piling up.
 
 ## Add build telemetry to CI
 

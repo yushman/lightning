@@ -99,6 +99,7 @@ async fn main() {
         )
         .route("/api/runs", post(web::ingest))
         .route("/api/flaky", get(web::flaky_api))
+        .route("/api/trends/regressions", get(web::regressions_api))
         .route("/api/builds", post(web::ingest_build).get(web::builds_api))
         .with_state(app);
     let listener = tokio::net::TcpListener::bind(&args.addr)

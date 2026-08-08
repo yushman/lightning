@@ -731,6 +731,117 @@ pub fn never_cached_tasks(
     .collect()
 }
 
+/// Middle value of a sorted `Vec` (upper-middle on an even count); `None` if empty.
+pub(crate) fn median(mut values: Vec<i64>) -> Option<i64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    Some(values[values.len() / 2])
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRegression {
+    pub path: String,
+    pub baseline_median_ms: i64,
+    pub recent_median_ms: i64,
+    /// Rounded percentage increase of recent over baseline.
+    pub pct_delta: i64,
+}
+
+/// Task paths on `branch` whose median duration (`success`/`failed` executions
+/// only) over the last `recent_window` builds has regressed against the median
+/// over the `baseline_window` builds immediately preceding them: both
+/// `recent_median > baseline_median * (1 + threshold_pct)` and
+/// `recent_median - baseline_median >= min_delta_ms` must hold, and each window
+/// needs at least `min_executions` qualifying executions. Sorted by pct_delta
+/// descending.
+pub fn task_regressions(
+    conn: &Connection,
+    branch: &str,
+    recent_window: usize,
+    baseline_window: usize,
+    min_executions: usize,
+    threshold_pct: f64,
+    min_delta_ms: i64,
+) -> Result<Vec<TaskRegression>> {
+    let total = recent_window + baseline_window;
+    let build_ids: Vec<i64> = conn
+        .prepare(
+            "SELECT id FROM builds WHERE branch = ?1
+             ORDER BY created_at DESC, id DESC LIMIT ?2",
+        )?
+        .query_map(params![branch, total as i64], |r| r.get(0))?
+        .collect::<Result<_>>()?;
+    if build_ids.len() <= recent_window {
+        // No builds left for a baseline window at all.
+        return Ok(Vec::new());
+    }
+    let recent_ids: std::collections::HashSet<i64> =
+        build_ids[..recent_window].iter().copied().collect();
+    let placeholders = vec!["?"; build_ids.len()].join(",");
+    let sql = format!(
+        "SELECT build_id, path, duration_ms FROM task_executions
+         WHERE build_id IN ({placeholders}) AND outcome IN ('success', 'failed')"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> = build_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
+        .collect();
+    let mut by_path: std::collections::HashMap<String, (Vec<i64>, Vec<i64>)> =
+        std::collections::HashMap::new();
+    let rows = stmt.query_map(params.as_slice(), |r| {
+        let build_id: i64 = r.get(0)?;
+        let path: String = r.get(1)?;
+        let duration_ms: i64 = r.get(2)?;
+        Ok((build_id, path, duration_ms))
+    })?;
+    for row in rows {
+        let (build_id, path, duration_ms) = row?;
+        let entry = by_path.entry(path).or_default();
+        if recent_ids.contains(&build_id) {
+            entry.0.push(duration_ms);
+        } else {
+            entry.1.push(duration_ms);
+        }
+    }
+    let mut out: Vec<TaskRegression> = by_path
+        .into_iter()
+        .filter_map(|(path, (recent, baseline))| {
+            if recent.len() < min_executions || baseline.len() < min_executions {
+                return None;
+            }
+            let recent_median_ms = median(recent)?;
+            let baseline_median_ms = median(baseline)?;
+            let delta = recent_median_ms - baseline_median_ms;
+            let relative_exceeded =
+                (recent_median_ms as f64) > (baseline_median_ms as f64) * (1.0 + threshold_pct);
+            if relative_exceeded && delta >= min_delta_ms {
+                let pct_delta = if baseline_median_ms == 0 {
+                    0
+                } else {
+                    ((delta as f64 / baseline_median_ms as f64) * 100.0).round() as i64
+                };
+                Some(TaskRegression {
+                    path,
+                    baseline_median_ms,
+                    recent_median_ms,
+                    pct_delta,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.pct_delta
+            .cmp(&a.pct_delta)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1078,5 +1189,128 @@ mod tests {
         let w = verdict_window(&conn, 1, 50).unwrap();
         assert_eq!(w.len(), 1);
         assert_eq!(w[0].verdict, Some(Verdict::Mixed));
+    }
+
+    #[test]
+    fn median_of_empty_is_none() {
+        assert_eq!(median(vec![]), None);
+    }
+
+    #[test]
+    fn median_picks_upper_middle_on_even_count() {
+        assert_eq!(median(vec![10, 20, 30, 40]), Some(30));
+        assert_eq!(median(vec![5, 1, 3]), Some(3));
+    }
+
+    fn build_with_task(
+        conn: &mut Connection,
+        key: &str,
+        branch: &str,
+        path: &str,
+        duration_ms: u64,
+    ) {
+        ingest_build(
+            conn,
+            &BuildPayload {
+                build_key: key.into(),
+                sha: Some("sha1".into()),
+                branch: Some(branch.into()),
+                ci_url: None,
+                outcome: BuildOutcome::Success,
+                requested_tasks: "build".into(),
+                gradle_version: None,
+                java_version: None,
+                total_ms: duration_ms,
+                configuration_ms: 0,
+                tasks: vec![TaskPayload {
+                    path: path.into(),
+                    outcome: TaskOutcome::Success,
+                    duration_ms,
+                }],
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn task_regressions_flags_by_both_thresholds() {
+        let mut conn = mem();
+        for i in 0..3 {
+            build_with_task(&mut conn, &format!("base{i}"), "main", ":slow", 2000);
+        }
+        for i in 0..3 {
+            build_with_task(&mut conn, &format!("recent{i}"), "main", ":slow", 3000);
+        }
+        let regressions = task_regressions(&conn, "main", 3, 3, 3, 0.25, 500).unwrap();
+        assert_eq!(regressions.len(), 1);
+        assert_eq!(regressions[0].path, ":slow");
+        assert_eq!(regressions[0].baseline_median_ms, 2000);
+        assert_eq!(regressions[0].recent_median_ms, 3000);
+        assert_eq!(regressions[0].pct_delta, 50);
+    }
+
+    #[test]
+    fn task_regressions_below_absolute_floor_not_flagged() {
+        let mut conn = mem();
+        for i in 0..3 {
+            build_with_task(&mut conn, &format!("base{i}"), "main", ":tiny", 100);
+        }
+        for i in 0..3 {
+            build_with_task(&mut conn, &format!("recent{i}"), "main", ":tiny", 200);
+        }
+        // 100% relative increase, but only 100ms absolute delta: below the 500ms floor
+        assert!(
+            task_regressions(&conn, "main", 3, 3, 3, 0.25, 500)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn task_regressions_below_min_executions_not_flagged() {
+        let mut conn = mem();
+        for i in 0..3 {
+            build_with_task(&mut conn, &format!("base{i}"), "main", ":sparse", 2000);
+        }
+        // only 2 executions in the recent window
+        for i in 0..2 {
+            build_with_task(&mut conn, &format!("recent{i}"), "main", ":sparse", 3000);
+        }
+        assert!(
+            task_regressions(&conn, "main", 3, 3, 3, 0.25, 500)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn task_regressions_absent_from_baseline_excluded() {
+        let mut conn = mem();
+        for i in 0..3 {
+            build_with_task(&mut conn, &format!("base{i}"), "main", ":old", 2000);
+        }
+        for i in 0..3 {
+            build_with_task(&mut conn, &format!("recent{i}"), "main", ":new-task", 3000);
+        }
+        // :new-task has no baseline-window executions at all
+        assert!(
+            task_regressions(&conn, "main", 3, 3, 3, 0.25, 500)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn task_regressions_no_baseline_builds_returns_empty() {
+        let mut conn = mem();
+        for i in 0..2 {
+            build_with_task(&mut conn, &format!("recent{i}"), "main", ":x", 3000);
+        }
+        // fewer builds on the branch than the recent window itself
+        assert!(
+            task_regressions(&conn, "main", 3, 3, 3, 0.25, 500)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

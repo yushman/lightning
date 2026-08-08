@@ -182,6 +182,32 @@ pub struct AffectedArgs {
     /// No output; exit 0 when something is affected, 3 when nothing is
     #[arg(long, conflicts_with_all = ["format", "json"])]
     pub quiet: bool,
+    /// Upsert a PR comment summarizing the affected scope (GitHub Actions
+    /// pull_request events only, needs GITHUB_TOKEN with pull-requests: write;
+    /// silently does nothing otherwise)
+    #[arg(long)]
+    pub pr_comment: bool,
+}
+
+const PR_COMMENT_MARKER: &str = "<!-- lightning:affected -->";
+
+fn pr_comment_body(selection: &Selection) -> String {
+    match &selection.everything {
+        Some(reason) => format!("⚡ **lightning affected**: everything affected — {reason}"),
+        None => {
+            let total = selection.lock.modules.len();
+            let affected = selection.modules.len();
+            let list: String = selection
+                .modules
+                .iter()
+                .map(|(path, _)| format!("- `{path}`"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "⚡ **lightning affected**: {affected} of {total} modules affected by this diff\n\n{list}"
+            )
+        }
+    }
 }
 
 pub fn run(dir: &Path, args: &AffectedArgs) -> Result<i32, String> {
@@ -194,6 +220,14 @@ pub fn run(dir: &Path, args: &AffectedArgs) -> Result<i32, String> {
     };
     if let Some(reason) = &selection.everything {
         eprintln!("lightning: warning: {reason}; selecting everything");
+    }
+    if args.pr_comment {
+        let ctx = crate::github::PrContext::resolve();
+        crate::github::post_pr_comment(
+            ctx.as_ref(),
+            PR_COMMENT_MARKER,
+            &pr_comment_body(&selection),
+        );
     }
     if args.quiet {
         return Ok(if selection.modules.is_empty() {
@@ -442,5 +476,40 @@ mod tests {
         let (everything, modules) = compute(&lock(), &BTreeSet::new());
         assert!(everything.is_none());
         assert!(modules.is_empty());
+    }
+
+    #[test]
+    fn pr_comment_body_lists_concrete_selection() {
+        let l = lock();
+        let (everything, modules) = compute(&l, &files(&["shared/src/S.java"]));
+        let selection = Selection {
+            base: "origin/main".into(),
+            merge_base: "abc123".into(),
+            everything,
+            modules,
+            lock: l,
+        };
+        let body = pr_comment_body(&selection);
+        assert!(body.contains("3 of 5 modules affected"));
+        assert!(body.contains("`:core`"));
+        assert!(body.contains("`:lib`"));
+        assert!(body.contains("`:app`"));
+    }
+
+    #[test]
+    fn pr_comment_body_states_everything_affected_reason() {
+        let mut l = lock();
+        l.unsupported = Some("dependency substitution into included build(s)".into());
+        let (everything, modules) = compute(&l, &files(&["core/src/main/java/C.java"]));
+        let selection = Selection {
+            base: "origin/main".into(),
+            merge_base: "abc123".into(),
+            everything,
+            modules,
+            lock: l,
+        };
+        let body = pr_comment_body(&selection);
+        assert!(body.contains("everything affected"));
+        assert!(body.contains("dependency substitution into included build(s)"));
     }
 }
